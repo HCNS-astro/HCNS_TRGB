@@ -1,0 +1,8 @@
+numpy
+scipy
+pandas
+matplotlib>=3.7
+astropy
+photutils
+PySide6>=6.6
+emcee
