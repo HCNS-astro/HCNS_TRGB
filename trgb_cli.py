@@ -37,6 +37,7 @@ def load_selection_file(path):
         "pencil_verts": payload.get("pencil"),
         "pencil_subtract": payload.get("pencil_subtract", False),
         "pencil_sub_verts": payload.get("pencil_sub"),
+        "bg_verts": payload.get("bg_pencil"),
         "inner_subtract": payload.get("inner_subtract", False),
         "a_in": a_in, "b_in": b_in,
         "color_min": color_min, "color_max": color_max,
@@ -149,6 +150,24 @@ def main():
                   f"{cfg['dm']} + M_TRGB {M_TRGB}) is outside the "
                   f"comfortable part of the fit range [{fit_lo:.2f}, "
                   f"{fit_hi:.2f}] -- set a per-galaxy fit_range")
+    # The likelihood's support must match the data's: a window reaching past
+    # the tightest faint cut (RGB selection or completeness limit) makes the
+    # model expect stars in a stretch the cuts emptied by construction, and
+    # the fake count deficit can pull the fit to a spurious faint break
+    # (DW1238M0105). Mirrors session.run_fit's support_warning.
+    data_faint = sel["mag_faint"]
+    if comp is not None and comp_faint is not None:
+        data_faint = min(data_faint, comp_faint)
+    eff_hi = min(fit_hi, asts.mag_range[1])
+    if eff_hi > data_faint + 1e-6:
+        print(f"{name}: WARNING: fit window faint edge {eff_hi:.3f} reaches "
+              f"{eff_hi - data_faint:.2f} mag past the data's faint "
+              f"truncation at {data_faint:.3f} (selection/completeness cut) "
+              f"-- the model expects stars in that empty stretch, so the "
+              f"likelihood sees a fake count deficit and can pull the fit "
+              f"to a spurious faint break. Lower --fit-hi to "
+              f"{data_faint:.2f} or relax the cut before trusting any "
+              f"result.")
     tip0 = tip_seed if np.isfinite(tip_seed) else 0.5 * (fit_lo + fit_hi)
     res, (ml_lo, ml_hi), _ = ml.fit_trgb_range(
         mag, asts, tip0=tip0, m_bright=fit_lo, m_faint=fit_hi)
