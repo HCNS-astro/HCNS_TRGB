@@ -18,7 +18,7 @@ import photometry
 import selection
 from acs_correction import correct_acs
 from galaxy_configs import (EXT_ERR_FRAC, M_TRGB, N_BOOT, N_TRIAL,
-                            SIG_CAL, SIG_PHOT, TIP_HI, TIP_LO)
+                            SIG_CAL, TIP_HI, TIP_LO)
 
 
 def load_selection_file(path):
@@ -194,7 +194,7 @@ def main():
     stat_kind = "photometric MC" if mc_unc else "bootstrap"
     a814_mean = float(df["A_F814W"].to_numpy()[keep].mean())
     sig_ext = EXT_ERR_FRAC * a814_mean
-    sig_sys_sq = sig_ext ** 2 + SIG_CAL ** 2 + SIG_PHOT ** 2
+    sig_sys_sq = sig_ext ** 2 + SIG_CAL ** 2
     mu = tip - M_TRGB
     mu_minus = float(np.sqrt(stat["minus"] ** 2 + sig_sys_sq))
     mu_plus = float(np.sqrt(stat["plus"] ** 2 + sig_sys_sq))
@@ -204,8 +204,8 @@ def main():
     print(f"{name}: error budget (mag): stat -{stat['minus']:.3f}"
           f"/+{stat['plus']:.3f} ({stat_kind}), extinction {sig_ext:.3f} "
           f"({EXT_ERR_FRAC:.0%} of <A_F814W> = {a814_mean:.3f}), calibration "
-          f"{SIG_CAL:.3f} (Jang & Lee 17 M_QT), photometric ZP "
-          f"{SIG_PHOT:.3f}; total (quadrature) -{mu_minus:.3f}/+{mu_plus:.3f}")
+          f"{SIG_CAL:.3f} (Jang & Lee 17 M_QT); total (quadrature) "
+          f"-{mu_minus:.3f}/+{mu_plus:.3f}")
     print(f"{name}: mu = {mu:.3f} -{mu_minus:.3f}/+{mu_plus:.3f} "
           f"(M_TRGB = {M_TRGB}), D = {dist_mpc:.2f} -{dist_minus:.2f}"
           f"/+{dist_plus:.2f} Mpc")

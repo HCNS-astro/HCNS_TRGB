@@ -19,13 +19,9 @@ N_BOOT = 500
 N_TRIAL = 1000
 
 #Jang & Lee 2017 (ApJ 835, 28) QT calibration.
-M_TRGB = -4.016
-SIG_CAL = 0.058
+M_TRGB = -4.015
+SIG_CAL = 0.056
 
-
-# Instrumental photometry systematic: ACS zero point + DOLPHOT PSF-to-aperture
-# correction, ~0.02 mag (Freedman 2021; CCHP error budgets). 
-SIG_PHOT = 0.02
 
 # Foreground-extinction systematic: the standard 10% fractional uncertainty on
 # the dust correction (Schlegel et al. 1998 map accuracy)
@@ -48,7 +44,6 @@ CONSTANTS = {
     "N_TRIAL": N_TRIAL,
     "M_TRGB": M_TRGB,
     "SIG_CAL": SIG_CAL,
-    "SIG_PHOT": SIG_PHOT,
     "EXT_ERR_FRAC": EXT_ERR_FRAC,
     "BIN_WIDTH": BIN_WIDTH,
     "TIP_LO": TIP_LO,

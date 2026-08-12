@@ -109,7 +109,10 @@ def build_model_grid(asts, dm=DM, m_min=-numpy.inf, m_max=numpy.inf, pad=PAD):
     return m_obs, m_true, completeness_true, err_kernel, window_weights
 
 
-#Gaussian Priors
+# Gaussian slope priors (mu, sigma), Makarov et al. 2006 sec. 6: the spread
+# of LF slopes measured in well-populated fields, applied as a priori
+# constraints where sparse data cannot fix the slopes. RGB slope a is stable
+# across galaxies (tight sigma); AGB slope c varies widely (loose sigma).
 SLOPE_PRIORS = {"a": (0.30, 0.07), "c": (0.30, 0.20)}
 
 # Optimizer bounds on the LF shape parameters (a, b, c); the tip's own bound is
