@@ -5,7 +5,8 @@
 Requires Python 3.10+.
 
 ```sh
-git clone <repo-url>
+git clone https://github.com/HCNS-astro/HCNS_TRGB.git
+cd HCNS_TRGB
 pip install -r requirements.txt
 ```
 
@@ -16,5 +17,4 @@ python3 trgb_gui.py
 ```
 
 ### macOS app: TODO
-```
 
