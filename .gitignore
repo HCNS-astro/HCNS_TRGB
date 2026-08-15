@@ -3,6 +3,7 @@ galaxies/
 *.fake
 
 *.png
+!gui/icon.png
 *.npz
 figures/
 galaxies_local.json
@@ -29,3 +30,8 @@ __pycache__/
 *.pyc
 .DS_Store
 *.swp
+
+# py2app bundle
+build/
+dist/
+*.icns

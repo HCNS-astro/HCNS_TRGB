@@ -9,15 +9,15 @@ import numpy as np
 
 import photometry
 from edge_detection import edge_detect
-
-# Tip search window; N_GRID is halved from the CLI's 1000-point grid to keep
-# repeated re-evaluation cheap.
-TIP_LO, TIP_HI = 20.0, 26.0
+# Edge detector window range: single source of truth in galaxy_configs,
+# re-exported here so edge_tip's defaults stay in sync with the pipeline's.
+from galaxy_configs import DEFAULT_COLOR, TIP_LO, TIP_HI
+# How many evenly spaced points for the edge detector curve based on `TIP_LO` and `TIP_HI`
 N_GRID = 500
 
 
 def build_arrays(df, color_correct=True):
-    """Per-star arrays the selection filters cut on, computed once.
+    """Per-star arrays (as opposed to binned-histograms) the selection filters cut on, computed once.
 
     The pipeline's magnitude construction: color-rectified F814W (photometry
     .color_correct) and the raw catalog e_F814W. color_correct=False keeps
@@ -38,10 +38,7 @@ def build_arrays(df, color_correct=True):
 
 
 def ellipse_mask(ra, dec, ra_cen, dec_cen, a, b, pa=0.0):
-    """Tangent-plane ellipse containment -- a/b in arcsec, pa in deg E of N.
-    Differs from exact spherical geometry (SkyCoord separations) by far below
-    an arcsecond over arcminute fields, with none of the astropy overhead,
-    which matters when the mask is re-evaluated repeatedly."""
+    """Tangent-plane ellipse containment a/b in arcsec, pa in deg E of N."""
     east = (ra - ra_cen) * np.cos(np.radians(dec_cen)) * 3600.0
     north = (dec - dec_cen) * 3600.0
     sin_pa, cos_pa = np.sin(np.radians(pa)), np.cos(np.radians(pa))
@@ -51,8 +48,8 @@ def ellipse_mask(ra, dec, ra_cen, dec_cen, a, b, pa=0.0):
 
 
 def ellipse_outline(ra_cen, dec_cen, a, b, pa=0.0, n=181):
-    """(ra, dec) polyline of the selection ellipse -- the inverse of the
-    ellipse_mask decomposition, so the drawn aperture IS the applied one."""
+    """(ra, dec) polyline of the selection ellipse; the inverse of the
+    ellipse_mask decomposition, so the drawn aperture is always the applied one. The polyline is determined from the ellipse_mask."""
     t = np.linspace(0.0, 2.0 * np.pi, n)
     u, v = a * np.cos(t), b * np.sin(t)
     sin_pa, cos_pa = np.sin(np.radians(pa)), np.cos(np.radians(pa))
@@ -64,9 +61,9 @@ def ellipse_outline(ra_cen, dec_cen, a, b, pa=0.0, n=181):
 
 
 def polygon_mask(ra, dec, verts):
-    """Even-odd ray-casting point-in-polygon test, vectorized over the
-    points (the freehand-polygon counterpart of ellipse_mask; pure numpy so
-    the selection core keeps its no-matplotlib property)."""
+    """Boolean mask of which (ra, dec) points fall inside the freehand
+    polygon ``verts``, via an even-odd ray-casting test vectorized over the
+    points. This is the pencil-tool counterpart of ellipse_mask."""
     v = np.asarray(verts, dtype=float)
     x = np.asarray(ra, dtype=float)
     y = np.asarray(dec, dtype=float)
@@ -82,23 +79,14 @@ def polygon_mask(ra, dec, verts):
 
 
 def apply_selection(cat, sel):
-    """Boolean masks for a filter set over precomputed arrays.
+    """Boolean masks for a filter set over the star arrays.
 
     ``sel`` keys: ra_cen, dec_cen, a, b, pa (arcsec/deg E of N), mode
     ("inside"/"outside"/"off"), color_min, color_max, mag_bright, mag_faint.
     Optional pencil keys: spatial_tool ("ellipse", the default, or
     "pencil") with pencil_verts, a freehand (ra, dec) polygon that replaces
-    the ellipse as the outer spatial region -- the mode setting applies to it
-    the same way; with no polygon given there is no spatial cut.
+    the ellipse as the outer spatial region."""
 
-    Optional subtraction keys (default off; applied in "inside" mode under
-    EITHER outer tool): inner_subtract with a_in/b_in deselects a
-    CONCENTRIC inner ellipse (the main ellipse's center and PA);
-    pencil_subtract with pencil_sub_verts deselects a freehand polygon.
-    Callers normally keep the two mutually exclusive, though this mask
-    applies whichever flags are set. Returns the spatial mask alone (for
-    sky plots/diagnostics) and the full RGB selection (spatial + color
-    window + magnitude range)."""
     verts = sel.get("pencil_verts")
     sub_verts = sel.get("pencil_sub_verts")
     if sel["mode"] == "off":
@@ -138,11 +126,8 @@ def apply_selection(cat, sel):
 
 
 def edge_tip(mag, err, tip_lo=TIP_LO, tip_hi=TIP_HI, n_grid=N_GRID):
-    """Continuous edge-detector response and its peak (the fast tip estimate).
-
-    Same construction as the pipeline: response on a grid over the sample's
-    magnitude span, peak taken inside [tip_lo, tip_hi]. Returns
-    (m_grid, edge, tip); tip is nan when the sample is too thin to say."""
+    """Continuous edge-detector response and its peak. Returns
+    (m_grid, edge, tip); tip is nan when the sample is too thin to calculate (less than 10 samples)."""
     if mag.size < 10:
         return None, None, np.nan
     m_grid = np.linspace(np.floor(mag.min()), np.ceil(mag.max()), n_grid)
@@ -154,10 +139,10 @@ def edge_tip(mag, err, tip_lo=TIP_LO, tip_hi=TIP_HI, n_grid=N_GRID):
 
 
 def default_selection(cfg, cat):
-    """Starting filters from the galaxy's pipeline config: its selection
+    """Starting selection filters from the galaxy's pipeline config: its selection
     ellipse (sky or the sky parameters of a pixel-projected one), its RGB color
     box, and the standard faint cut. Falls back to a circle on the stellar
-    density peak when no aperture is configured."""
+    density peak (as an initial guess) when no aperture is configured."""
     if "ellipse" in cfg:
         ra_cen, dec_cen, a, b, pa = cfg["ellipse"]
     elif "ellipse_px" in cfg:
@@ -171,7 +156,7 @@ def default_selection(cfg, cat):
         ra_cen = 0.5 * (ra_edges[i] + ra_edges[i + 1])
         dec_cen = 0.5 * (dec_edges[j] + dec_edges[j + 1])
         a, b, pa = 30.0, 30.0, 0.0
-    color_min, color_max = cfg.get("color", (0.6, 1.2))
+    color_min, color_max = cfg.get("color", DEFAULT_COLOR)
     return {"ra_cen": ra_cen, "dec_cen": dec_cen, "a": a, "b": b, "pa": pa,
             "mode": "inside", "color_min": color_min, "color_max": color_max,
             "mag_bright": 18.0, "mag_faint": 26.0}

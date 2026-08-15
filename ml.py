@@ -1,14 +1,40 @@
 """Maximum-likelihood TRGB fit (Makarov et al. 2006, Eqs. 3-7).
-
-The AST-derived ingredients -- completeness(m), the photometric scatter error(m),
-and the error kernel gauss_error(m | m0) -- come from an ast_model.ASTModel
-built from a galaxy's artificial-star tests. This module wires them into the
-observed luminosity function phi(m|x) and the Eq. 7 likelihood, then fits
-x = (m_trgb, a, b, c) to the observed magnitudes.
 """
 
 import numpy
 import scipy.optimize
+
+
+# Default fit window (mag) when the galaxy config gives no fit_range.
+FIT_RANGE = (23.0, 25.5)
+
+DM = 0.005            # integration step for the convolution
+
+# True-magnitude padding (mag) beyond the fit window on each side: photometric
+# error scatters stars across the window edges, so truncating the integral at
+# the window (PAD = 0) biases the recovered tip brighter.
+PAD = 1.0
+
+# Optimizer starting point x0 = (m_trgb, a, b, c).
+X0_DEFAULT = (24.0, 0.3, 0.3, 0.3)
+
+# Extra slope seeds (a, b, c) fit_trgb_range restarts from.
+RANGE_SLOPE_SEEDS = ((0.3, 0.3, 0.3), (0.1, 0.6, 0.3),
+                     (0.5, 0.6, 0.3), (0.3, 0.6, 0.6))
+
+# Gaussian slope priors (mu, sigma), Makarov et al. 2006 sec. 6
+# The jump amplitude b gets no prior: the size of the break is
+# the tip-detection evidence.
+SLOPE_PRIORS = {"a": (0.30, 0.07), "c": (0.30, 0.20)}
+
+# Optimizer bounds on the LF shape parameters (a, b, c); the tip's own bound is
+# the fit range and is prepended per call. 
+SHAPE_BOUNDS = [(0.0, 1.0),    # a : RGB slope (faint side)
+                (-1.0, 3.0),   # b : jump amplitude at the tip
+                (0.0, 1.0)]    # c : AGB slope (bright side)
+
+# fit_trgb_on_grid status code: no usable stars in the window, not optimized.
+EMPTY_WINDOW = -1
 
 
 def trgb_lf(m, m_trgb, a, b, c):
@@ -53,15 +79,6 @@ def trgb_lf_observed(m_true, m_trgb, a, b, c, completeness_true, err_kernel):
                                          completeness_true)
 
 
-FIT_RANGE = (23.0, 25.5)
-
-DM = 0.005            # fine integration step for the convolution
-# True-magnitude padding (mag) beyond the fit window on each side: photometric
-# error scatters stars across the window edges, so truncating the integral at
-# the window (PAD = 0) biases the recovered tip brighter.
-PAD = 1.0
-
-
 def build_model_grid(asts, dm=DM, m_min=-numpy.inf, m_max=numpy.inf, pad=PAD):
     """Magnitude axes plus the x-independent AST ingredients: completeness(m')
     and the photometric-error kernel e(m|m'). Built once and reused across every
@@ -91,7 +108,6 @@ def build_model_grid(asts, dm=DM, m_min=-numpy.inf, m_max=numpy.inf, pad=PAD):
     m_max = min(m_max, asts.mag_range[1])
     m_obs = numpy.arange(m_min, m_max + 0.5 * dm, dm)
 
-
     t_lo = max(m_min - pad, asts.mag_range[0])
     t_hi = min(m_max + pad, asts.mag_range[1])
     m_true = numpy.arange(t_lo, t_hi + 0.5 * dm, dm)
@@ -107,25 +123,6 @@ def build_model_grid(asts, dm=DM, m_min=-numpy.inf, m_max=numpy.inf, pad=PAD):
     
     window_weights = asts.gauss_window_integral(m_min, m_max, m_true)
     return m_obs, m_true, completeness_true, err_kernel, window_weights
-
-
-# Gaussian slope priors (mu, sigma), Makarov et al. 2006 sec. 6: the spread
-# of LF slopes measured in well-populated fields, applied as a priori
-# constraints where sparse data cannot fix the slopes. RGB slope a is stable
-# across galaxies (tight sigma); AGB slope c varies widely (loose sigma).
-SLOPE_PRIORS = {"a": (0.30, 0.07), "c": (0.30, 0.20)}
-
-# Optimizer bounds on the LF shape parameters (a, b, c); the tip's own bound is
-# the fit range and is prepended per call. Kept as a module constant so the
-# railed-parameter check (shape_on_bound) cannot drift out of step with what
-# the optimizer was actually given.
-SHAPE_BOUNDS = [(0.0, 1.0),    # a : RGB slope (faint side)
-                (-1.0, 2.0),   # b : jump amplitude at the tip
-                (0.0, 1.0)]    # c : AGB slope (bright side)
-
-
-
-EMPTY_WINDOW = -1
 
 
 def effective_count(data_mags, weights):
@@ -193,7 +190,7 @@ def neg_log_likelihood(params, data_mags, m_obs, m_true, completeness_true,
 
 
 def fit_trgb_on_grid(data_mags, m_obs, m_true, completeness_true, err_kernel,
-                     window_weights, x0=(24.0, 0.3, 0.3, 0.3),
+                     window_weights, x0=X0_DEFAULT,
                      m_bright=-numpy.inf, m_faint=numpy.inf, weights=None,
                      priors=SLOPE_PRIORS):
     """Fit x = (m_trgb, a, b, c) on a prebuilt model grid via Eq. 7.
@@ -218,7 +215,7 @@ def fit_trgb_on_grid(data_mags, m_obs, m_true, completeness_true, err_kernel,
     )
 
 
-def fit_trgb(data_mags, asts, x0=(24.0, 0.3, 0.3, 0.3), m_bright=-numpy.inf,
+def fit_trgb(data_mags, asts, x0=X0_DEFAULT, m_bright=-numpy.inf,
              m_faint=numpy.inf, weights=None, priors=SLOPE_PRIORS, verbose=True):
     """Fit x = (m_trgb, a, b, c) to observed F814W_0 magnitudes via Eq. 7."""
 
@@ -251,17 +248,15 @@ def fit_trgb(data_mags, asts, x0=(24.0, 0.3, 0.3, 0.3), m_bright=-numpy.inf,
 
 
 
-RANGE_SLOPE_SEEDS = ((0.3, 0.3, 0.3), (0.1, 0.6, 0.3),
-                     (0.5, 0.6, 0.3), (0.3, 0.6, 0.6))
-
-
 def fit_trgb_range(data_mags, asts, tip0, m_bright=-numpy.inf,
                    m_faint=numpy.inf, weights=None, slopes0=(0.3, 0.3, 0.3),
                    priors=SLOPE_PRIORS, slope_seeds=RANGE_SLOPE_SEEDS,
                    verbose=True):
     """Fit over a FIXED magnitude range.
 
-    Returns ``(result, (m_bright, m_faint), n_iter)``; ``n_iter`` is always 1
+    Returns ``(result, (m_bright, m_faint))``: the best fit across the slope
+    seeds and the window actually used (the requested one clamped to the AST
+    validity range).
     """
 
     m_bright = max(m_bright, asts.mag_range[0])
@@ -295,7 +290,16 @@ def fit_trgb_range(data_mags, asts, tip0, m_bright=-numpy.inf,
         if result.railed:
             print(f"WARNING: parameter(s) {', '.join(result.railed)} on the "
                   f"fit bound -- corner solution, not a measurement")
-    return result, (m_bright, m_faint), 1
+    return result, (m_bright, m_faint)
+
+
+def comp_limit(color, curve, coeffs):
+    """Completeness faint limit at a color: comp50 is a linear polynomial
+    (slope, intercept), comp90 the col_comp_func piecewise model
+    (tran, plat, alpha)."""
+    if curve == "comp50":
+        return numpy.polyval(coeffs, color)
+    return col_comp_func(color, *coeffs)
 
 
 def col_comp_func(col, tran, plat, alpha):

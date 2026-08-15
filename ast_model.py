@@ -1,8 +1,7 @@
 """Artificial-star-test (AST) completeness and photometric-error model.
 
 Loads a galaxy's AST catalog, applies the same dereddening and quadratic color
-correction as the real photometry, and exposes the ingredients the
-maximum-likelihood TRGB fit needs: completeness(m), the photometric scatter
+correction as the real photometry, and provides completeness(m), the photometric scatter
 error(m), the bias(m), and the Gaussian error kernel gauss_error(m | m').
 
 Completeness, scatter, and bias are smooth analytic fits to the ASTs (an erf

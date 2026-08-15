@@ -13,8 +13,9 @@ GALAXIES_SUBDIR = "galaxies"    # Photometry is stored in this folder.
 REQUIRED_KEYS = ("phot", "ast")
 
 
+# Default RGB color box when a galaxy config gives no "color" entry
+# (selection.default_selection).
 DEFAULT_COLOR = (0.6, 1.2)
-MAG_FAINT = 99
 N_BOOT = 500
 N_TRIAL = 1000
 
@@ -33,13 +34,11 @@ BIN_WIDTH = 0.15
 
 TIP_LO, TIP_HI = 20.0, 26.0
 CMD_YLIM = (28.0, 20.0)
-LF_XLIM = (20.0, 28.0)
 
 # The constants above as one dict, for callers that hand them around as a
 # single mapping.
 CONSTANTS = {
     "DEFAULT_COLOR": DEFAULT_COLOR,
-    "MAG_FAINT": MAG_FAINT,
     "N_BOOT": N_BOOT,
     "N_TRIAL": N_TRIAL,
     "M_TRGB": M_TRGB,
@@ -49,7 +48,6 @@ CONSTANTS = {
     "TIP_LO": TIP_LO,
     "TIP_HI": TIP_HI,
     "CMD_YLIM": CMD_YLIM,
-    "LF_XLIM": LF_XLIM,
 }
 
 

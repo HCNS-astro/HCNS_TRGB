@@ -4,6 +4,28 @@ import numpy as np
 import pandas as pd
 from astropy.io import fits
 from astropy.wcs import WCS
+from astropy.wcs.utils import proj_plane_pixel_area
+
+
+# S/N cut (dual_snr_mask); only applies to non-CSV photometries that carry
+# the per-band S/N columns.
+SNR_MIN = 4
+SNR_COLS = ("SNR_F606W", "SNR_F814W")
+
+# Histogram bin width (mag) for the background decontamination.
+DECON_BIN_WIDTH = 0.05
+
+# Foreground extinction (de-reddening): A_lambda / E(B-V) for ACS
+# F606W/F814W, rv = 3.1
+# (https://iopscience.iop.org/article/10.1088/0004-637X/737/2/103)
+R_F606W = 2.471
+R_F814W = 1.526
+
+# Quadratic TRGB color correction (color_correct):
+# m_corr = m - alpha*(color - gamma)^2 - beta*(color - gamma)
+CORR_ALPHA = .159
+CORR_BETA = -0.047
+CORR_GAMMA = 1.1
 
 
 def read_phot_csv(data_dir, phot_file):
@@ -50,10 +72,7 @@ def read_completeness(data_dir, filename="completeness.dat"):
 # --- Chip selection ---
 # Assign stars to the two detector chips of a mosaic by their ra/dec columns,
 # using each chip's rotated sky rectangle (measured by chip_extent.py's
-# rotated_extent on the split chip images). The rectangles follow the chips'
-# tilt on the sky, so unlike axis-aligned RA/Dec boxes they barely overlap;
-# chip_masks still resolves any residual overlap along the inter-chip gap
-# deterministically by making box 1 inclusive and box 2 exclusive of it.
+# rotated_extent on the split chip images). 
 
 def rotated_box_mask(df, ra_cen, dec_cen, a, b, pa=0.0):
     """Boolean mask, True where a row's (ra, dec) lies in a rotated sky box.
@@ -78,11 +97,6 @@ def rotated_box_mask(df, ra_cen, dec_cen, a, b, pa=0.0):
 def chip_masks(df, box1, box2):
     """Disjoint per-chip masks from two (ra_cen, dec_cen, a, b, pa) rotated
     boxes: chip 1 is its full box, chip 2 is its box minus chip 1's.
-
-    NOTE: a rotated rectangle overshoots the (slightly sheared) chip footprint
-    at its corners, so near the inter-chip gap box 1 can reach past the real
-    chip-1 edge and steal chip-2 stars. Prefer chip_masks_footprint when the
-    split chip images are available -- it assigns by the true pixel footprint.
     """
     mask1 = rotated_box_mask(df, *box1)
     mask2 = rotated_box_mask(df, *box2) & ~mask1
@@ -125,8 +139,8 @@ def chip_masks_footprint(df, chip_fits):
 
 def point_on_chip(ra, dec, chip_fits):
     """True if a single (ra, dec) point in degrees lands on the finite
-    science pixels of a split-chip image (chip_footprint_mask for one
-    point) -- the footprint counterpart of point_in_rotated_box."""
+    pixels of a split-chip image (chip_footprint_mask for one
+    point)."""
     point = pd.DataFrame({"ra": [ra], "dec": [dec]})
     return bool(chip_footprint_mask(point, chip_fits)[0])
 
@@ -135,7 +149,6 @@ def chip_footprint_area(chip_fits):
     """On-sky area (arcsec^2) of a split chip's finite science pixels:
     finite-pixel count times the WCS pixel area -- the same construction
     as the hand-measured "chip_areas" config entries."""
-    from astropy.wcs.utils import proj_plane_pixel_area
     with fits.open(chip_fits) as hdul:
         n_finite = int(np.isfinite(hdul[1].data).sum())
         w = WCS(hdul[1].header, naxis=2)
@@ -153,47 +166,9 @@ def point_in_rotated_box(ra, dec, box):
 # Remove the expected field contamination from the galaxy sample, using an
 # off-galaxy detector chip as the background field.
 
-def decontaminate(mag, bg_mag, bg_scale, bin_width=0.05, return_keep=False):
-    """Background-subtract by REMOVING stars, keeping the survivors' magnitudes.
-
-    Histogram the background on fine bins, scale its counts by ``bg_scale``
-    (= galaxy/background area ratio), and drop that many real stars from each
-    bin of the galaxy sample. Returns ``(mags, weights)``: the surviving stars'
-    ACTUAL magnitudes with weight +1, so the fit sees the background-subtracted
-    LF without any change to the magnitudes themselves.
-
-    Stars are removed rather than re-emitted at bin centers: quantizing every
-    magnitude onto a ``bin_width`` comb would be coarser than the photometric
-    scatter near the tip (sigma ~ 0.038 mag), and removal keeps the fit
-    independent of ``bin_width`` except through the (integer) number subtracted
-    per bin.
-
-    NEGATIVE counts are kept, not clipped. Where the scaled background exceeds
-    the galaxy counts, the bin empties (it cannot give up stars it does not have)
-    and the remaining deficit is emitted as a single entry at the bin center
-    carrying a negative weight. ``ml.neg_log_likelihood`` handles those terms
-    directly, so an over-subtracted bin pushes the model down there instead of
-    silently reverting to zero. Only these residual entries sit at bin centers;
-    every real star keeps its measured magnitude.
-
-    Deterministic: within a bin the stars to drop are taken at evenly spaced
-    ranks of the magnitude-sorted members, so no random selection is involved and
-    repeat runs agree.
-
-    With ``return_keep`` the boolean survivor mask over the INPUT ``mag`` is
-    returned as a third value, so a caller can align a parallel array (e.g. the
-    colors, or the per-star sigma) to the surviving real stars. The mask covers
-    only the real stars; the negative-weight deficit entries are appended after
-    them in ``mags`` and have no counterpart in the input.
-
-    The per-bin integer count is allocated by CUMULATIVE rounding, not by
-    rounding each bin on its own. Rounding bin by bin silently throws the whole
-    subtraction away whenever the scaled background is thin: with the Corvus A
-    chip background (46 stars after RGB cuts, area scale 0.145) every 0.05-mag
-    bin holds 1-2 stars, ``round(0.145 * 2) == 0``, and all 6.7 stars that
-    should come out stay in. Differencing the rounded cumulative expectation
-    instead makes the TOTAL removed match ``bg_scale * N_bg`` to within one
-    star, while still placing the removals where the background actually is.
+def decontaminate(mag, bg_mag, bg_scale, bin_width=DECON_BIN_WIDTH,
+                  return_keep=False):
+    """Background-subtract by subtracting stars, keeping the rest of the stars.
     """
     mag = np.asarray(mag, dtype=float)
     lo = np.floor(min(mag.min(), bg_mag.min()))
@@ -202,8 +177,10 @@ def decontaminate(mag, bg_mag, bg_scale, bin_width=0.05, return_keep=False):
     centers = 0.5 * (edges[:-1] + edges[1:])
 
     bg_counts, _ = np.histogram(bg_mag, bins=edges)
-    # Fractional expectation per bin -> integer removals, allocated so the
-    # running total tracks the running expectation (see the docstring).
+    # Fractional expectations -> integer removals by rounding the CUMULATIVE
+    # expectation and differencing: fractions carry forward until they amount
+    # to a whole star, so bins expecting < 0.5 each still remove their
+    # collective due (per-bin rounding would remove none of them).
     expected = np.cumsum(bg_scale * bg_counts.astype(float))
     n_remove = np.diff(np.concatenate([[0.0], np.round(expected)])).astype(int)
     gal_bin = np.clip(np.digitize(mag, edges) - 1, 0, len(edges) - 2)
@@ -232,14 +209,6 @@ def decontaminate(mag, bg_mag, bg_scale, bin_width=0.05, return_keep=False):
 
 
 # --- Signal-to-noise selection ---
-# Reject the spurious band of faint, low-significance detections by requiring
-# S/N >= SNR_MIN in BOTH F606W and F814W. Only applied to catalogs that carry
-# explicit per-band S/N columns (DW1329-45); catalogs without them (Corvus A,
-# NGC253-DW1) are left untouched.
-SNR_MIN = 4
-SNR_COLS = ("SNR_F606W", "SNR_F814W")
-
-
 def has_snr(df):
     """True if the catalog carries the per-band S/N columns to cut on."""
     return all(col in df.columns for col in SNR_COLS)
@@ -251,21 +220,8 @@ def dual_snr_mask(df, snr_min=SNR_MIN):
             (df["SNR_F814W"].to_numpy() >= snr_min))
 
 
-# --- Foreground extinction (de-reddening) ---
-# A_lambda / E(B-V) for ACS F606W/F814W, rv = 3.1
-# (https://iopscience.iop.org/article/10.1088/0004-637X/737/2/103)
-R_F606W = 2.471
-R_F814W = 1.526
-
-
-# Quadratic TRGB color correction: m_corr = m - alpha*(color - gamma)^2 - beta*(color - gamma)
-CORR_ALPHA = .159
-CORR_BETA = -0.047
-CORR_GAMMA = 1.1
-
-
+# --- TRGB color rectification ---
 def color_correct(f814w, color):
-    """Apply the quadratic TRGB color correction to the F814W magnitude
-    (rectifies the RGB tip)."""
+    """Apply the quadratic TRGB color correction to the F814W magnitude (rectifies the RGB tip)."""
     dcolor = color - CORR_GAMMA
     return f814w - CORR_ALPHA * dcolor ** 2 - CORR_BETA * dcolor

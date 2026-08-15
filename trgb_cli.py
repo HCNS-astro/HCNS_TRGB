@@ -6,12 +6,11 @@ Usage:
 """
 
 import argparse
-import json
 
 import numpy as np
 
 import ast_model
-import bootstrap
+import uncertainty
 import galaxy_configs
 import ml
 import photometry
@@ -19,39 +18,26 @@ import selection
 from acs_correction import correct_acs
 from galaxy_configs import (EXT_ERR_FRAC, M_TRGB, N_BOOT, N_TRIAL,
                             SIG_CAL, TIP_HI, TIP_LO)
+from gui import config_io
 
 
 def load_selection_file(path):
-    """Selection dict from a saved filter_selection.json (files without the
-    optional keys fall back to defaults)."""
-    with open(path) as f:
-        payload = json.load(f)
-    ra_cen, dec_cen, a, b, pa = payload["ellipse"]
-    mag_bright, mag_faint = payload.get("mag_range", (18.0, 26.0))
-    color_min, color_max = payload["color"]
-    a_in, b_in = payload.get("inner_ellipse", (10.0, 10.0))
-    return {
-        "ra_cen": ra_cen, "dec_cen": dec_cen, "a": a, "b": b, "pa": pa,
-        "mode": payload.get("ellipse_mode", "inside"),
-        "spatial_tool": payload.get("spatial_tool", "ellipse"),
-        "pencil_verts": payload.get("pencil"),
-        "pencil_subtract": payload.get("pencil_subtract", False),
-        "pencil_sub_verts": payload.get("pencil_sub"),
-        "bg_verts": payload.get("bg_pencil"),
-        "inner_subtract": payload.get("inner_subtract", False),
-        "a_in": a_in, "b_in": b_in,
-        "color_min": color_min, "color_max": color_max,
-        "mag_bright": mag_bright, "mag_faint": mag_faint,
-    }
+    """Selection dict from a saved filter_selection.json, through the same
+    loader the GUI uses (gui.config_io) so the two cannot drift apart."""
+    sel, _fit, _payload = config_io.load_selection(path)
+    return sel
 
 
-def completeness_faint_limit(cat, spatial, sel, comp90):
+def completeness_faint_limit(cat, spatial, sel, comp, curve="comp90"):
+    coeffs = comp.get(curve)
+    if coeffs is None:
+        return None
     in_box = (spatial & (cat["color"] >= sel["color_min"])
               & (cat["color"] <= sel["color_max"]))
-    below = in_box & (cat["mag"] > ml.col_comp_func(cat["color"], *comp90))
+    below = in_box & (cat["mag"] > ml.comp_limit(cat["color"], curve, coeffs))
     if not below.any():
         return None
-    return float(ml.col_comp_func(cat["color"][below].min(), *comp90))
+    return float(ml.comp_limit(cat["color"][below].min(), curve, coeffs))
 
 
 def main():
@@ -86,6 +72,8 @@ def main():
         df["F606W_0"], df["F814W_0"] = correct_acs(df["F606W_0"],
                                                    df["F814W_0"])
         print(f"{name}: applied WFC3->ACS transformation")
+
+    #Since some photometry do not contain SNR information.
     if photometry.has_snr(df):
         snr_keep = photometry.dual_snr_mask(df)
         print(f"{name}: S/N>={photometry.SNR_MIN:g} cut kept "
@@ -104,12 +92,13 @@ def main():
 
    
     comp = photometry.read_completeness(cfg["data_dir"])
-    if comp is not None:
-        comp_faint = completeness_faint_limit(cat, spatial, sel,
-                                              comp["comp90"])
+    comp_faint = None
+    if comp is not None and sel.get("apply_comp_limit", True):
+        curve = sel.get("comp_curve", "comp90")
+        comp_faint = completeness_faint_limit(cat, spatial, sel, comp, curve)
         if comp_faint is None:
-            print(f"{name}: no star crosses the 90% completeness curve -- "
-                  f"no completeness faint limit applied")
+            print(f"{name}: no star crosses the {curve} completeness curve "
+                  f"-- no completeness faint limit applied")
         else:
             n_drop = int(np.sum(keep & (cat["mag"] >= comp_faint)))
             keep &= cat["mag"] < comp_faint
@@ -134,7 +123,7 @@ def main():
         wfc3_to_acs=bool(cfg.get("wfc3_to_acs")),
         col_range=(sel["color_min"], sel["color_max"]))
 
-    # --- ML fit ---
+    # ML fit config code
     fit_lo, fit_hi = cfg.get("fit_range", ml.FIT_RANGE)
     if args.fit_lo is not None:
         fit_lo = args.fit_lo
@@ -154,7 +143,6 @@ def main():
     # the tightest faint cut (RGB selection or completeness limit) makes the
     # model expect stars in a stretch the cuts emptied by construction, and
     # the fake count deficit can pull the fit to a spurious faint break
-    # (DW1238M0105). Mirrors session.run_fit's support_warning.
     data_faint = sel["mag_faint"]
     if comp is not None and comp_faint is not None:
         data_faint = min(data_faint, comp_faint)
@@ -169,7 +157,7 @@ def main():
               f"{data_faint:.2f} or relax the cut before trusting any "
               f"result.")
     tip0 = tip_seed if np.isfinite(tip_seed) else 0.5 * (fit_lo + fit_hi)
-    res, (ml_lo, ml_hi), _ = ml.fit_trgb_range(
+    res, (ml_lo, ml_hi) = ml.fit_trgb_range(
         mag, asts, tip0=tip0, m_bright=fit_lo, m_faint=fit_hi)
     tip = res.x[0]
     railed = list(getattr(res, "railed", []))
@@ -180,19 +168,19 @@ def main():
         print(f"{name}: published TRGB {cfg['paper_trgb']} "
               f"({tip - cfg['paper_trgb']:+.3f} vs ML)")
 
-    # --- Uncertainties ---
+    #Uncertainties
     boot_unc = mc_unc = None
     if args.n_boot > 0:
-        ml_boot = bootstrap.bootstrap_ml(mag, asts, x0=res.x, m_bright=ml_lo,
+        ml_boot = uncertainty.bootstrap_ml(mag, asts, x0=res.x, m_bright=ml_lo,
                                          m_faint=ml_hi, n_boot=args.n_boot)
-        boot_unc = bootstrap.summarize(ml_boot, name=f"{name} ML")
+        boot_unc = uncertainty.summarize(ml_boot, name=f"{name} ML")
         print(f"{name}: ML TRGB = {tip:.3f} -{boot_unc['minus']:.3f}"
               f"/+{boot_unc['plus']:.3f} (68% bootstrap CI)")
     if args.mc:
-        ml_perturb = bootstrap.perturb_ml(mag, asts, x0=res.x, m_bright=ml_lo,
+        ml_perturb = uncertainty.perturb_ml(mag, asts, x0=res.x, m_bright=ml_lo,
                                           m_faint=ml_hi,
                                           n_trial=args.n_trial)
-        mc_unc = bootstrap.summarize(ml_perturb, name=f"{name} ML",
+        mc_unc = uncertainty.summarize(ml_perturb, name=f"{name} ML",
                                      kind="photometric MC")
         print(f"{name}: ML TRGB = {tip:.3f} -{mc_unc['minus']:.3f}"
               f"/+{mc_unc['plus']:.3f} (68% photometric-error MC; median "

@@ -1,17 +1,4 @@
-"""Split a drizzled two-chip FITS mosaic into one file per chip.
-
-The DRC image holds both detector chips in a single array, surrounded by NaNs
-and separated by a (diagonal) NaN gap. Connected-component labeling of the
-finite pixels finds the two chips; each is cropped to its bounding box, pixels
-belonging to the other chip are re-NaNed, and CRPIX1/2 are shifted by the crop
-offset so the WCS still maps pixels to the correct sky positions. The WHT and
-CTX extensions are cropped identically.
-
-A mosaic drizzled with gap-spanning dithers has NO NaN gap -- the finite
-pixels form one connected region and the true chip boundary is gone from the
-pixels. Such an image cannot be split (and cannot supply an off-galaxy chip
-for background subtraction); split_chips/check_two_chips raise ValueError.
-
+"""Split a drizzled two-chip FITS mosaic into one file per chip. This is used to perform background subtraction by looking at the chip not containing the galaxy.
 Usage: python split_chips.py <mosaic_drc.fits>
 Writes <mosaic_drc>_chip1.fits and <mosaic_drc>_chip2.fits.
 """
@@ -25,14 +12,25 @@ from scipy import ndimage
 
 
 def _find_chips(hdul, path, min_frac=0.25):
-    """(labels, [chip1_label, chip2_label]) of the two chips in an open
-    mosaic, ordered bottom-to-top on the image. Raises ValueError when the
-    image does not hold two cleanly separated comparable chips: a
-    single-chip / subarray exposure, or a mosaic whose inter-chip gap was
-    filled by drizzling (one connected region). The second-largest
-    component must be at least ``min_frac`` of the largest -- anything
-    smaller is a stray speck, not a detector chip."""
+    """Locate the two detector chips inside an open two-chip mosaic.
+
+    A drizzled two-chip image (e.g. ACS/WFC or WFC3/UVIS) covers the sky
+    with two rectangular chip footprints separated by a thin gap of blank
+    (NaN) pixels where the physical gap between the detectors fell. This
+    finds those footprints by labeling the connected regions of finite
+    science pixels: each chip shows up as one large connected component,
+    and the gap keeps them apart.
+
+    Returns ``(labels, [chip1_label, chip2_label])`` where ``labels`` is the
+    full ndimage.label component map of the SCI extension (same shape as the
+    image, 0 = blank, k = pixel belongs to component k) and the two label
+    values pick out the chips, ordered bottom-to-top on the image so "chip 1"
+    and "chip 2" are stable across calls."""
+
     name = os.path.basename(path)
+    # A pixel is part of a chip footprint iff its value is finite;
+    # the inter-chip gap and the empty corners around the rotated footprint
+    # are NaN. Label every 4-connected island of finite pixels.
     finite = np.isfinite(hdul[1].data)
     labels, n = ndimage.label(finite)
     if n < 2:
@@ -40,16 +38,23 @@ def _find_chips(hdul, path, min_frac=0.25):
             f"{name}: the finite pixels form one connected region -- the "
             "inter-chip gap has been filled by drizzling, so the two "
             "detector chips cannot be identified")
+    # Pixel count of every component (labels run 1..n; index k-1 holds k).
     sizes = ndimage.sum_labels(np.ones_like(labels), labels,
                                index=range(1, n + 1))
-    # Two largest components are the chips; anything else is stray specks.
+    # The two largest components are the chip candidates; smaller ones are
+    # stray specks (isolated pixels that survived the drizzle edges).
     chip_labels = np.argsort(sizes)[::-1][:2] + 1
+    # Real chips are the same physical size, so the runner-up must be at
+    # least min_frac of the largest; far smaller means there is only one
+    # chip plus debris, not a two-chip mosaic.
     big, small = sizes[chip_labels[0] - 1], sizes[chip_labels[1] - 1]
     if small < min_frac * big:
         raise ValueError(
             f"{name}: second pixel component is only {small / big:.1%} "
             "the size of the largest -- not a two-chip mosaic")
-    # Order chip 1/2 bottom-to-top on the image.
+    # Sort the two labels by the top row of each chip's bounding box so
+    # chip 1 is always the lower chip on the image, whatever label numbers
+    # ndimage happened to assign.
     chip_labels = sorted(
         chip_labels,
         key=lambda lab: ndimage.find_objects(labels == lab)[0][0].start)
@@ -79,7 +84,7 @@ def split_chips(path, min_frac=0.25):
             sl = ndimage.find_objects(mask)[0]
 
             out = [hdul[0].copy()]
-            for ext in (1, 2, 3):          # SCI, WHT, CTX
+            for ext in (1, 2, 3):
                 h = hdul[ext].copy()
                 data = h.data[sl].copy()
                 # Blank out pixels from the other chip inside the bounding box.
