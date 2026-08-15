@@ -12,7 +12,7 @@ pip install -r requirements.txt
 ## Run
 
 ```sh
-python3 trgb_gui.py              # GUI, default galaxy
+python3 trgb_gui.py             
 ```
 
 ### macOS app: TODO
