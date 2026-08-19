@@ -1,4 +1,6 @@
-galaxies/
+# keep the galaxies/ folder in the repo but none of its contents
+galaxies/*
+!galaxies/.gitkeep
 *.fits
 *.fake
 .presentation/
