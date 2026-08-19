@@ -377,12 +377,12 @@ class MainWindow(QMainWindow):
                 f"{head}: {injected['n']} of "
                 f"{injected['n_true']} drawn stars kept, over "
                 f"[{injected['range'][0]:.1f}, {injected['range'][1]:.1f}] "
-                f"({stages}; seed {injected['seed']}) -- "
+                f"({stages}; seed {injected['seed']}); "
                 f"{truth}. Press “Run fit” and compare the "
                 f"fitted tip to the injected one (dotted line on the CMD). "
                 f"Toolbar “Reload” returns to the real galaxy.")
         else:
-            self.results.text.setText("No fit yet -- adjust the selection "
+            self.results.text.setText("No fit yet. Adjust the selection "
                                       "and press “Run fit”.")
         self.uncertainty.clear()
         self._set_busy(False, "")

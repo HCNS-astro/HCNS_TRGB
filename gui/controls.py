@@ -1045,7 +1045,7 @@ class UncertaintyPanel(QWidget):
         self.clear()
 
     def clear(self):
-        self.text.setText("No error budget yet -- run a fit.")
+        self.text.setText("No error budget yet. Run a fit.")
 
     def show_outcome(self, out):
         if out is None or not out.success:
@@ -1055,7 +1055,7 @@ class UncertaintyPanel(QWidget):
         if e is None:
             self.text.setText(
                 "No error budget: the tip railed at a fit bound (corner "
-                "solution -- no distance or uncertainties quoted).")
+                "solution; no distance or uncertainties quoted).")
             return
         have_total = out.mu_minus is not None
 
@@ -1096,7 +1096,7 @@ class UncertaintyPanel(QWidget):
                 f"mag</b> → D = {out.dist_mpc:.2f} "
                 f"−{out.dist_minus:.2f}/+{out.dist_plus:.2f} Mpc")
         else:
-            tail.append("no total quoted -- the statistical term is missing "
+            tail.append("no total quoted: the statistical term is missing "
                         "(run the fit with bootstrap CI or photometric MC)")
         self.text.setText("".join(html) + "<br>".join(tail))
 
@@ -1110,7 +1110,7 @@ class ResultsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        self.text = QLabel("No fit yet -- adjust the selection and press "
+        self.text = QLabel("No fit yet. Adjust the selection and press "
                            "“Run fit”.")
         self.text.setTextFormat(Qt.RichText)
         self.text.setWordWrap(True)
@@ -1179,7 +1179,7 @@ class ResultsPanel(QWidget):
             return
         lines = []
         if stale:
-            lines.append("Selection changed since this fit -- re-run to "
+            lines.append("Selection changed since this fit; re-run to "
                          "refresh.")
         ci = ""
         if out.boot_ci is not None:
@@ -1228,7 +1228,7 @@ class ResultsPanel(QWidget):
                 f"MCMC convergence suspect: worst R̂ = {r[worst]:.3f} "
                 f"({names[worst]}), min N_eff ≈ {np.nanmin(ne):.0f} "
                 f"(want R̂ ≤ {MCMC_RHAT_MAX:g} and N_eff ≥ "
-                f"{MCMC_NEFF_MIN:g}) -- run a longer chain before trusting "
+                f"{MCMC_NEFF_MIN:g}). Run a longer chain before trusting "
                 f"the posterior CI.")
         if "m_trgb" in out.railed:
             lo, hi = out.fit_range
@@ -1262,6 +1262,6 @@ class ResultsPanel(QWidget):
                     f"+{out.dist_plus:.2f} Mpc</b> &nbsp; {calib}")
             else:
                 lines.append(f"μ = {out.mu:.3f}, D = {out.dist_mpc:.2f} "
-                             f"Mpc &nbsp; {calib} &nbsp; (no CI -- enable "
+                             f"Mpc &nbsp; {calib} &nbsp; (no CI; enable "
                              f"bootstrap or MC)")
         self.text.setText("<br>".join(lines))

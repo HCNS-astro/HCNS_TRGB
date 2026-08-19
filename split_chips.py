@@ -35,8 +35,8 @@ def _find_chips(hdul, path, min_frac=0.25):
     labels, n = ndimage.label(finite)
     if n < 2:
         raise ValueError(
-            f"{name}: the finite pixels form one connected region -- the "
-            "inter-chip gap has been filled by drizzling, so the two "
+            f"{name}: the finite pixels form one connected region (the "
+            "inter-chip gap has been filled by drizzling), so the two "
             "detector chips cannot be identified")
     # Pixel count of every component (labels run 1..n; index k-1 holds k).
     sizes = ndimage.sum_labels(np.ones_like(labels), labels,
@@ -51,7 +51,7 @@ def _find_chips(hdul, path, min_frac=0.25):
     if small < min_frac * big:
         raise ValueError(
             f"{name}: second pixel component is only {small / big:.1%} "
-            "the size of the largest -- not a two-chip mosaic")
+            "the size of the largest, so this is not a two-chip mosaic")
     # Sort the two labels by the top row of each chip's bounding box so
     # chip 1 is always the lower chip on the image, whatever label numbers
     # ndimage happened to assign.

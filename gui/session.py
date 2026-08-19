@@ -523,7 +523,7 @@ class GalaxySession:
             return
         if not on1 and not on2:
             self.bg_reason = (f"galaxy center ({gal_ra:.5f}, {gal_dec:.5f}) "
-                              "lands on neither chip -- cannot tell "
+                              "lands on neither chip, so it cannot tell "
                               "which chip is off-galaxy")
             return
         # The pipeline's precedence: on chip 1 (even inside an overlap with
@@ -742,13 +742,13 @@ class GalaxySession:
             if overlap:
                 notes.append(f"the background region overlaps the galaxy "
                              f"selection ({overlap} selected stars inside "
-                             f"it) -- it should cover field stars only")
+                             f"it); it should cover field stars only")
         tool_pencil = sel.get("spatial_tool", "ellipse") == "pencil"
         pencil = (tool_pencil and sel.get("pencil_verts")
                   and len(sel["pencil_verts"]) >= 3)
         if sel["mode"] == "inside" and tool_pencil and not pencil:
             bg_scale = 1.0
-            notes.append("pencil tool active but no region drawn -- "
+            notes.append("pencil tool active but no region drawn; "
                          "background not area-scaled (scale = 1)")
         elif sel["mode"] == "inside":
             # outer aperture area, minus any subtraction regions (they are
@@ -765,8 +765,8 @@ class GalaxySession:
             bg_scale = max(area, 0.0) / bg_area
         else:
             bg_scale = 1.0
-            notes.append("no galaxy aperture (ellipse mode is not 'inside') "
-                         "-- background not area-scaled (scale = 1)")
+            notes.append("no galaxy aperture (ellipse mode is not 'inside'); "
+                         "background not area-scaled (scale = 1)")
         return mag[cut], float(bg_scale), "; ".join(notes), cut
 
     def bg_preview(self, sel, comp_faint, source):
@@ -797,8 +797,9 @@ class GalaxySession:
         if not spatial.any():
             # .mean() on an empty mask is NaN, which would silently poison
             # every dereddened model magnitude
-            raise ValueError("the spatial selection contains no stars -- "
-                             "no extinction mean to deredden the AST model")
+            raise ValueError("the spatial selection contains no stars, so "
+                             "there is no extinction mean to deredden the "
+                             "AST model")
         a606 = float(self.cat["a606"][spatial].mean())
         a814 = float(self.cat["a814"][spatial].mean())
         col_range = (sel["color_min"], sel["color_max"])
@@ -827,7 +828,7 @@ class GalaxySession:
 
         if not params.fit_lo < params.fit_hi:
             out.message = (f"fit range [{params.fit_lo:.2f}, "
-                           f"{params.fit_hi:.2f}] is empty -- the bright "
+                           f"{params.fit_hi:.2f}] is empty: the bright "
                            f"limit must be less than the faint limit")
             return out
 
@@ -835,12 +836,12 @@ class GalaxySession:
         keep = applied["keep"]
         mag = self.cat["mag"][keep]
         if mag.size < 10:
-            out.message = f"only {mag.size} stars selected -- nothing to fit"
+            out.message = f"only {mag.size} stars selected; nothing to fit"
             return out
 
         out.edge_seed = self.edge_seed(keep, applied["comp_faint"])
         if not np.isfinite(out.edge_seed):
-            out.message = ("edge detector found no tip in the selection -- "
+            out.message = ("edge detector found no tip in the selection; "
                            "cannot seed the ML fit")
             return out
 
@@ -856,13 +857,13 @@ class GalaxySession:
                 verts = sel.get("bg_verts")
                 if not verts or len(verts) < 3:
                     out.message = ("background subtraction: no background "
-                                   "region drawn -- draw one on the sky "
+                                   "region drawn; draw one on the sky "
                                    "panel, or switch the sample source to "
                                    "the off-galaxy chip")
                     return out
                 if _polygon_area_arcsec2(verts) <= 0.0:
                     out.message = ("background subtraction: the drawn "
-                                   "background region has zero area -- "
+                                   "background region has zero area; "
                                    "draw a closed region, not a line")
                     return out
             elif not self.bg_available():
@@ -877,14 +878,14 @@ class GalaxySession:
             if bg_mag.size == 0:
                 out.bg = {"used": False, "source": bg_source,
                           "note": (f"{src_desc} has no stars after the CMD "
-                                   "cuts -- background subtraction skipped")}
+                                   "cuts; background subtraction skipped")}
             else:
                 fit_mag, mag_w, decon_keep = photometry.decontaminate(
                     mag, bg_mag, bg_scale, return_keep=True)
                 n_kept = int(decon_keep.sum())
                 if n_kept < 10:
                     out.message = (f"background subtraction left only "
-                                   f"{n_kept} stars -- nothing to fit")
+                                   f"{n_kept} stars; nothing to fit")
                     return out
                 out.bg = {"used": True, "source": bg_source,
                           "chip": (self.bg_chip if bg_source == "chip"
@@ -947,7 +948,7 @@ class GalaxySession:
         # measurement -- neither may be quoted as a fitted tip.
         if getattr(res, "status", 0) == ml.EMPTY_WINDOW:
             out.message = (f"no usable stars in the fit window "
-                           f"[{ml_lo:.2f}, {ml_hi:.2f}] -- widen the range "
+                           f"[{ml_lo:.2f}, {ml_hi:.2f}]; widen the range "
                            f"or relax the selection cuts")
             return out
         if not res.success:
@@ -1230,7 +1231,7 @@ class SyntheticSession(GalaxySession):
                 f"completeness draw. The fitted completeness curve is "
                 f"{c_lo:.2f} at F814W = {m_lo:.1f} and {c_hi:.2f} at "
                 f"{m_hi:.1f}, and most drawn stars sit at the faint end of "
-                f"the range where it is lowest -- the survey would detect "
+                f"the range where it is lowest; the survey would detect "
                 f"almost nothing there. Brighten the generation range, "
                 f"raise 'stars', or untick 'completeness accept/reject'.")
 
@@ -1275,7 +1276,7 @@ class SyntheticSession(GalaxySession):
                     "a606": np.full(n, base.cat["a606"].mean()),
                     "a814": np.full(n, base.cat["a814"].mean())}
         self.comp = base.comp
-        self.bg_reason = "synthetic catalog -- no detector chips"
+        self.bg_reason = "synthetic catalog (no detector chips)"
         if tip is not None:
             self.cfg["paper_trgb"] = tip    # the CMD truth line (relabeled)
         self.injected = {"tip": tip, "a": p.a_rgb, "b": p.b_jump,
