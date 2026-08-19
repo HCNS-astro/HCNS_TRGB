@@ -17,7 +17,7 @@ python3 trgb_gui.py
 ```
 
 ## Load Galaxies
-To load galaxies, download photometry from the Box folder and put them in the galaxies/ folder. 
+To load galaxies, download photometry from the box folder and put them in the galaxies/ folder. 
 
 ### macOS app: TODO
 
