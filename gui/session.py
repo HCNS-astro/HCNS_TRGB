@@ -10,6 +10,7 @@ import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
+import pandas as pd
 from astropy.io import fits
 from astropy.wcs import WCS, FITSFixedWarning
 
@@ -105,14 +106,15 @@ class FitParams:
 class MockParams:
     """Synthetic-catalog parameters (SyntheticSession). The generator is a
     three-stage forward model, each degradation stage optional:
-    1. draw true magnitudes from the ideal broken power law (tip + a, b, c)
-       over [mag_bright, mag_faint];
+    1. truth -- either draw magnitudes from the ideal broken power law
+       (tip + a, b, c) over [mag_bright, mag_faint], or take F606W/F814W
+       from a PARSEC mock catalog shifted by a distance modulus;
     2. add photometric uncertainties -- Gaussian scatter with the fitted
        AST error curve sigma(F814W);
     3. apply completeness -- one uniform 0-1 draw per star, kept when it
        falls below the fitted completeness curve C(F814W) at the star's
        (scattered) magnitude."""
-    tip_mag: float = 25.0            # injected tip, F814W
+    tip_mag: float = 25.0            # injected tip, F814W (lf source)
     mag_bright: float = 18.0         # magnitudes are drawn over
     mag_faint: float = 26.0          # [mag_bright, mag_faint]
     n_true: int = 20000              # stars drawn (stage 3 may drop some)
@@ -122,6 +124,15 @@ class MockParams:
     add_scatter: bool = True         # stage 2 on/off
     apply_completeness: bool = True  # stage 3 on/off
     seed: int = 0
+    source: str = "lf"               # "lf" broken power law | "parsec" file
+    parsec_path: str = ""            # PARSEC mock catalog (CMD-web CSV .dat)
+    parsec_mu: float = 0.0           # distance modulus added to its
+                                     # ABSOLUTE magnitudes
+    parsec_rectify: bool = True      # apply the pipeline's QT color
+                                     # rectification (photometry
+                                     # .color_correct) to the PARSEC mags,
+                                     # so the mock enters the fit in the
+                                     # same frame as a real catalog
 
 
 # Minimum fraction of the MCMC tip posterior that must lie near the point fit
@@ -1098,11 +1109,12 @@ class SyntheticSession(GalaxySession):
     any catalog -- inside the fit window, where completeness is high, the
     mismatch with these idealized data is small.)
 
-    Only the F814W magnitudes carry the physics. Colors are resampled from
-    the base catalog's stars inside the current color box and sky positions
-    are drawn as an ellipse-shaped Gaussian blob at the current aperture
-    center, so the CMD/sky panels and the spatial/color cuts behave like a
-    real galaxy's -- cosmetically.
+    Only the F814W magnitudes carry the physics. For the LF source, colors
+    are resampled from the base catalog's stars inside the current color
+    box (cosmetic); a PARSEC source brings its own F606W-F814W colors.
+    Sky positions are drawn as an ellipse-shaped Gaussian blob at the
+    current aperture center, so the CMD/sky panels and the spatial/color
+    cuts behave like a real galaxy's.
 
     Built like a real session: construct, then load() from a LoadWorker.
     Reloading the galaxy from the toolbar returns to the real catalog.
@@ -1132,18 +1144,12 @@ class SyntheticSession(GalaxySession):
 
     def load(self):
         base, sel, p = self._base, self._sel, self._params
-        tip = float(p.tip_mag)
         m_lo, m_hi = float(p.mag_bright), float(p.mag_faint)
         if not m_lo < m_hi:
             raise ValueError(
                 f"generation magnitude range is empty: bright limit "
                 f"{m_lo:.2f} must be above (less than) faint limit "
                 f"{m_hi:.2f}")
-        if not (m_lo < tip < m_hi):
-            raise ValueError(
-                f"input tip {tip:.2f} is outside the generation range "
-                f"[{m_lo:.1f}, {m_hi:.1f}] -- move the tip or widen the "
-                f"range")
         # The fitted error/completeness curves (functions of F814W) that
         # drive the optional degradation stages below.
         self._gen_asts = (base.ensure_asts(sel)
@@ -1151,31 +1157,59 @@ class SyntheticSession(GalaxySession):
                           else None)
         rng = np.random.default_rng(p.seed)
 
-        # 1. Draw true magnitudes from the IDEAL broken-power-law LF
-        # (ml.trgb_lf) over the requested range, by inverse-CDF sampling.
-        grid = np.linspace(m_lo, m_hi, 4000)
-        pdf = ml.trgb_lf(grid, tip, p.a_rgb, p.b_jump, p.c_agb)
-        cdf = np.concatenate([[0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1])
-                                               * np.diff(grid))])
-        cdf /= cdf[-1]
-        mag = np.interp(rng.random(p.n_true), cdf, grid)
+        # 1. True magnitudes: either the PARSEC mock catalog shifted to
+        # apparent magnitudes (which also fixes the true colors), or an
+        # inverse-CDF draw from the IDEAL broken-power-law LF (ml.trgb_lf)
+        # over the requested range.
+        if p.source == "parsec":
+            # The mock's frame is decided at generation: QT-rectified (like
+            # every real catalog the pipeline builds) or raw F814W. The
+            # session flag follows the choice so the fit's AST model, the
+            # isochrone overlay and the axis label agree with the data.
+            self.color_correct = bool(p.parsec_rectify)
+            mag, color, tip = self._parsec_truth(p, m_lo, m_hi, rng)
+        else:
+            tip = float(p.tip_mag)
+            if not (m_lo < tip < m_hi):
+                raise ValueError(
+                    f"input tip {tip:.2f} is outside the generation range "
+                    f"[{m_lo:.1f}, {m_hi:.1f}] -- move the tip or widen the "
+                    f"range")
+            grid = np.linspace(m_lo, m_hi, 4000)
+            pdf = ml.trgb_lf(grid, tip, p.a_rgb, p.b_jump, p.c_agb)
+            cdf = np.concatenate([[0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1])
+                                                   * np.diff(grid))])
+            cdf /= cdf[-1]
+            mag = np.interp(rng.random(p.n_true), cdf, grid)
+            color = None            # cosmetic, resampled below
+        n_true = mag.size
 
         # 2. (optional) Add photometric uncertainties: Gaussian scatter
-        # with the fitted AST error curve sigma(F814W).
+        # with the fitted AST error curve sigma(F814W). PARSEC colors get
+        # their own F606W draw (the curve evaluated at the star's F606W)
+        # minus the F814W noise, so the CMD broadens like real photometry.
         if p.add_scatter:
-            mag = mag + rng.normal(0.0, 1.0, mag.size) * self._error_curve(mag)
+            noise = rng.normal(0.0, 1.0, mag.size) * self._error_curve(mag)
+            if color is not None:
+                sig606 = self._error_curve(mag + color)
+                color = (color + rng.normal(0.0, 1.0, mag.size) * sig606
+                         - noise)
+            mag = mag + noise
 
         # 3. (optional) Apply completeness: one uniform 0-1 draw per star,
         # kept when it falls below the fitted completeness curve C(F814W)
         # at the star's (scattered) magnitude.
         if p.apply_completeness:
-            mag = mag[rng.random(mag.size) < self._comp_curve(mag)]
+            kept = rng.random(mag.size) < self._comp_curve(mag)
+            mag = mag[kept]
+            if color is not None:
+                color = color[kept]
         n = mag.size
         if n < 10:
             c_lo = float(self._comp_curve(m_lo))
             c_hi = float(self._comp_curve(m_hi))
             raise ValueError(
-                f"only {n} of {p.n_true} synthetic stars survived the "
+                f"only {n} of {n_true} synthetic stars survived the "
                 f"completeness draw. The fitted completeness curve is "
                 f"{c_lo:.2f} at F814W = {m_lo:.1f} and {c_hi:.2f} at "
                 f"{m_hi:.1f}, and most drawn stars sit at the faint end of "
@@ -1183,15 +1217,17 @@ class SyntheticSession(GalaxySession):
                 f"almost nothing there. Brighten the generation range, "
                 f"raise 'stars', or untick 'completeness accept/reject'.")
 
-        # Colors: resample the base catalog's stars inside the color box so
-        # the synthetic RGB sits where the real one does on the CMD.
-        col_lo, col_hi = sel["color_min"], sel["color_max"]
-        pool = base.cat["color"]
-        pool = pool[(pool >= col_lo) & (pool <= col_hi)]
-        if pool.size >= 50:
-            color = rng.choice(pool, size=n, replace=True)
-        else:
-            color = rng.uniform(col_lo, col_hi, size=n)
+        # Colors (lf source only): resample the base catalog's stars inside
+        # the color box so the synthetic RGB sits where the real one does
+        # on the CMD.
+        if color is None:
+            col_lo, col_hi = sel["color_min"], sel["color_max"]
+            pool = base.cat["color"]
+            pool = pool[(pool >= col_lo) & (pool <= col_hi)]
+            if pool.size >= 50:
+                color = rng.choice(pool, size=n, replace=True)
+            else:
+                color = rng.uniform(col_lo, col_hi, size=n)
 
         # Positions: ellipse-aligned Gaussian blob (sigma = semi-axis / 2)
         # at the current aperture, so the spatial ellipse selects sensibly.
@@ -1223,13 +1259,62 @@ class SyntheticSession(GalaxySession):
                     "a814": np.full(n, base.cat["a814"].mean())}
         self.comp = base.comp
         self.bg_reason = "synthetic catalog -- no detector chips"
-        self.cfg["paper_trgb"] = tip    # the CMD truth line (relabeled)
+        if tip is not None:
+            self.cfg["paper_trgb"] = tip    # the CMD truth line (relabeled)
         self.injected = {"tip": tip, "a": p.a_rgb, "b": p.b_jump,
-                         "c": p.c_agb, "n": n, "n_true": p.n_true,
+                         "c": p.c_agb, "n": n, "n_true": n_true,
                          "seed": p.seed, "range": (m_lo, m_hi),
                          "scatter": p.add_scatter,
-                         "completeness": p.apply_completeness}
+                         "completeness": p.apply_completeness,
+                         "source": p.source}
+        if p.source == "parsec":
+            self.injected["file"] = os.path.basename(p.parsec_path)
+            self.injected["mu"] = float(p.parsec_mu)
+            self.injected["rectified"] = bool(p.parsec_rectify)
         return self
+
+    def _parsec_truth(self, p, m_lo, m_hi, rng):
+        """True (F814W, F606W-F814W) pairs from a PARSEC mock catalog:
+        the absolute magnitudes shifted by the distance modulus, optionally
+        QT-rectified (parsec_rectify), cut to the generation range, and
+        subsampled to at most n_true stars. The truth tip is the brightest
+        RGB star (PARSEC evolutionary label 3) when the label column is
+        present, else None (no truth line)."""
+        if not p.parsec_path or not os.path.isfile(p.parsec_path):
+            raise ValueError(
+                f"PARSEC mock file not found: {p.parsec_path or '(none)'} "
+                f"-- pick the catalog in the synthetic-data box")
+        tbl = pd.read_csv(p.parsec_path)
+        missing = [c for c in ("F606Wmag", "F814Wmag")
+                   if c not in tbl.columns]
+        if missing:
+            raise ValueError(
+                f"{os.path.basename(p.parsec_path)} is missing column(s) "
+                f"{', '.join(missing)} -- expected a CMD-web style table")
+        mag = tbl["F814Wmag"].to_numpy(float) + p.parsec_mu
+        color = (tbl["F606Wmag"] - tbl["F814Wmag"]).to_numpy(float)
+        if p.parsec_rectify:
+            # Same QT rectification build_arrays applies to real catalogs,
+            # flattening the tip's color slope the way the fit and the M_QT
+            # zero point assume. Skipped, the mags stay true F814W and the
+            # whole session runs in the raw frame (color_correct False).
+            mag = photometry.color_correct(mag, color)
+        tip = None
+        if "label" in tbl.columns:
+            rgb = tbl["label"].to_numpy() == 3
+            if rgb.any():
+                tip = float(mag[rgb].min())
+        inside = (mag >= m_lo) & (mag <= m_hi)
+        mag, color = mag[inside], color[inside]
+        if mag.size == 0:
+            raise ValueError(
+                f"no PARSEC stars land in [{m_lo:.1f}, {m_hi:.1f}] with "
+                f"distance modulus {p.parsec_mu:.2f} -- adjust the modulus "
+                f"or the generation range")
+        if mag.size > p.n_true:
+            pick = rng.choice(mag.size, p.n_true, replace=False)
+            mag, color = mag[pick], color[pick]
+        return mag, color, tip
 
     def _error_curve(self, m):
         """The fitted AST photometric sigma as a function of F814W, held at
@@ -1276,8 +1361,12 @@ class SyntheticSession(GalaxySession):
         generation range, times the magnitude-independent fraction the
         spatial/color cuts keep -- so incompleteness shows up as the gap
         between histogram and phi_ideal instead of being renormalized away.
-        Returns None when the visible interval is empty."""
+        Returns None when the visible interval is empty, and for a PARSEC
+        source (no analytic truth LF -- the truth there is the catalog
+        itself and the labeled tip)."""
         inj = self.injected
+        if inj.get("source") == "parsec":
+            return None
         g_lo, g_hi = inj["range"]
         m_lo = max(g_lo, sel["mag_bright"])
         m_hi = min(g_hi, sel["mag_faint"])

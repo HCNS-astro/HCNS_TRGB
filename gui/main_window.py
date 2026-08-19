@@ -26,8 +26,10 @@ DEBOUNCE_MS = 75
 
 class MainWindow(QMainWindow):
 
-    def __init__(self, galaxies, constants, initial_galaxy="corvus"):
+    def __init__(self, galaxies, constants, initial_galaxy=None):
         super().__init__()
+        if initial_galaxy is None and galaxies:
+            initial_galaxy = sorted(galaxies)[0]
         self.galaxies = galaxies
         self.constants = constants
         self.session = None
@@ -49,7 +51,8 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(QLabel("Galaxy: "))
         self.galaxy_combo = QComboBox()
         self.galaxy_combo.addItems(sorted(galaxies))
-        self.galaxy_combo.setCurrentText(initial_galaxy)
+        if initial_galaxy is not None:
+            self.galaxy_combo.setCurrentText(initial_galaxy)
         toolbar.addWidget(self.galaxy_combo)
         self.add_galaxy_action = toolbar.addAction("Add galaxy…")
         self.edit_galaxy_action = toolbar.addAction("Edit galaxy…")
@@ -161,9 +164,29 @@ class MainWindow(QMainWindow):
         self.results.cancelRequested.connect(self._cancel_fit)
         self.results.distributionRequested.connect(self._show_tip_distribution)
 
-        self._switch_galaxy(initial_galaxy)
+        if initial_galaxy is not None:
+            self._switch_galaxy(initial_galaxy)
+        else:
+            self._show_empty_state()
+            QTimer.singleShot(0, self._add_galaxy)
 
     # ---------- galaxy loading ----------
+
+    def _show_empty_state(self):
+        """No galaxies installed: everything that needs a loaded session is
+        disabled and Add galaxy… is the one live action. Entered on an empty
+        launch and when the last galaxy is removed; left through the normal
+        load path once a galaxy is added (_loaded re-enables the widgets)."""
+        self.session = None
+        self.last_outcome = None
+        self._outcome_stale = False
+        self._set_busy(True, "")
+        self.add_galaxy_action.setEnabled(True)
+        self.results.text.setText(
+            "<b>No galaxies installed.</b> Use toolbar “Add galaxy…” to "
+            "register one: put the photometry and AST CSVs in a folder "
+            "under galaxies/ and point the dialog at it.")
+        self.status_label.setText("no galaxies installed")
 
     def _busy_with_worker(self, action):
         """True (after telling the user) when a fit is in progress --
@@ -175,6 +198,8 @@ class MainWindow(QMainWindow):
         return True
 
     def _switch_galaxy(self, galaxy):
+        if galaxy not in self.galaxies:    # e.g. the combo emptying out
+            return
         if self._busy_with_worker("switching galaxies"):
             current = self.session
             if isinstance(current, SyntheticSession):
@@ -240,14 +265,20 @@ class MainWindow(QMainWindow):
             return
         os.remove(target)
         del self.galaxies[key]
-        replacement = sorted(self.galaxies)[0]
         self.galaxy_combo.blockSignals(True)
         self.galaxy_combo.clear()
         self.galaxy_combo.addItems(sorted(self.galaxies))
-        self.galaxy_combo.setCurrentText(replacement)
+        if self.galaxies:
+            self.galaxy_combo.setCurrentText(sorted(self.galaxies)[0])
         self.galaxy_combo.blockSignals(False)
+        if not self.galaxies:
+            self._show_empty_state()
+            self.status_label.setText(
+                f"removed {key} (data files untouched) -- "
+                f"no galaxies left")
+            return
         self.status_label.setText(f"removed {key} (data files untouched)")
-        self._switch_galaxy(replacement)
+        self._switch_galaxy(sorted(self.galaxies)[0])
 
     def _clear_load_worker(self):
         if self._load_worker is not None:
@@ -303,6 +334,7 @@ class MainWindow(QMainWindow):
         if cfg.get("dm") is not None:
             self.mock_controls.set_default_tip(cfg["dm"]
                                                + self.constants["M_TRGB"])
+            self.mock_controls.set_default_mu(cfg["dm"])
         elif cfg.get("paper_trgb") is not None:
             self.mock_controls.set_default_tip(cfg["paper_trgb"])
         if injected:
@@ -310,14 +342,27 @@ class MainWindow(QMainWindow):
                       f"{'on' if injected['scatter'] else 'off'}, "
                       f"completeness "
                       f"{'on' if injected['completeness'] else 'off'}")
+            if injected.get("source") == "parsec":
+                truth = (f"known truth: <b>tip = {injected['tip']:.3f}</b> "
+                         f"(brightest labeled RGB star)"
+                         if injected["tip"] is not None else
+                         "true tip unknown (no PARSEC label column)")
+                frame = ("QT-rectified" if injected.get("rectified")
+                         else "raw F814W")
+                head = (f"<b>Synthetic catalog</b> from {injected['file']} "
+                        f"at distance modulus {injected['mu']:.2f} "
+                        f"({frame})")
+            else:
+                truth = (f"known truth: <b>tip = {injected['tip']:.3f}</b>, "
+                         f"a = {injected['a']:g}, b = {injected['b']:g}, "
+                         f"c = {injected['c']:g}")
+                head = "<b>Synthetic catalog</b>"
             self.results.text.setText(
-                f"<b>Synthetic catalog</b>: {injected['n']} of "
+                f"{head}: {injected['n']} of "
                 f"{injected['n_true']} drawn stars kept, over "
                 f"[{injected['range'][0]:.1f}, {injected['range'][1]:.1f}] "
                 f"({stages}; seed {injected['seed']}) -- "
-                f"known truth: <b>tip = {injected['tip']:.3f}</b>, "
-                f"a = {injected['a']:g}, b = {injected['b']:g}, "
-                f"c = {injected['c']:g}. Press “Run fit” and compare the "
+                f"{truth}. Press “Run fit” and compare the "
                 f"fitted tip to the injected one (dotted line on the CMD). "
                 f"Toolbar “Reload” returns to the real galaxy.")
         else:
