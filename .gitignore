@@ -1,6 +1,7 @@
 galaxies/
 *.fits
 *.fake
+.presentation/
 
 *.png
 !gui/icon.png
