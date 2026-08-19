@@ -247,6 +247,17 @@ class SelectionControls(QGroupBox):
 
         form.addRow("a [″]", self.a)
         form.addRow("b [″]", self.b)
+        self.ab_link = QCheckBox("link b = a")
+        self.ab_link.setToolTip(
+            "Keep the main ellipse's semi-axes equal: moving either slider "
+            "moves the other, so the aperture stays a circle. Checking it "
+            "snaps b to the current a.")
+        form.addRow("", self.ab_link)
+        self.ab_link.toggled.connect(self._ab_link_toggled)
+        # connected BEFORE the generic _emit hookups below, so the mirror
+        # lands first and the refresh sees both axes already equal
+        self.a.valueChanged.connect(lambda *_: self._sync_ab(self.a))
+        self.b.valueChanged.connect(lambda *_: self._sync_ab(self.b))
         form.addRow("PA [° E of N]", self.pa)
 
         mode_row = QWidget()
@@ -357,6 +368,18 @@ class SelectionControls(QGroupBox):
         self.pencil_sub_clear.setEnabled(on)
         self._emit()
 
+    def _ab_link_toggled(self, on):
+        if on:
+            self.b.set_value(self.a.value())
+            self._emit()
+
+    def _sync_ab(self, source):
+        """Mirror one semi-axis onto the other while the link is on
+        (set_value emits nothing, so no feedback loop)."""
+        if self.ab_link.isChecked():
+            other = self.b if source is self.a else self.a
+            other.set_value(source.value())
+
     def _tool_changed(self, *_):
         """Gray the OUTER ellipse's semi-axes out while the pencil is the
         active spatial tool (values kept -- switching back restores them).
@@ -365,6 +388,7 @@ class SelectionControls(QGroupBox):
         pencil = self.tool_pencil.isChecked()
         self.a.setEnabled(not pencil)
         self.b.setEnabled(not pencil)
+        self.ab_link.setEnabled(not pencil)
         self.pencil_clear.setEnabled(pencil)
         self._emit()
 
@@ -451,6 +475,7 @@ class SelectionControls(QGroupBox):
             self._ra0, self._dec0 = sel["ra_cen"], sel["dec_cen"]
             self.dra.set_value(0.0)
             self.ddec.set_value(0.0)
+            self.ab_link.setChecked(False)  # a saved a != b must load as-is
             self.a.set_value(sel["a"])
             self.b.set_value(sel["b"])
             self.pa.set_value(sel["pa"])
@@ -1053,7 +1078,8 @@ class UncertaintyPanel(QWidget):
         for label, mn, pl, note in terms:
             if mn is None:
                 html.append(f"<tr><td>{label}</td>"
-                            f"<td align='right' colspan='2'>—&nbsp;&nbsp;</td>"
+                            f"<td align='right' colspan='2'>n/a&nbsp;&nbsp;"
+                            f"</td>"
                             f"<td></td><td>enable bootstrap or MC</td></tr>")
             else:
                 html.append(f"<tr><td>{label}&nbsp;&nbsp;</td>"
@@ -1204,19 +1230,22 @@ class ResultsPanel(QWidget):
                 f"(want R̂ ≤ {MCMC_RHAT_MAX:g} and N_eff ≥ "
                 f"{MCMC_NEFF_MIN:g}) -- run a longer chain before trusting "
                 f"the posterior CI.")
-        if out.mcmc_disagrees:
+        if "m_trgb" in out.railed:
+            lo, hi = out.fit_range
+            edge, fix = (("bright", f"lower the bright limit below {lo:.2f}")
+                         if abs(out.tip - lo) <= abs(out.tip - hi) else
+                         ("faint", f"raise the faint limit above {hi:.2f}"))
             lines.append(
-                f"<b>MCMC DISAGREES WITH POINT FIT:</b> only "
-                f"{out.mcmc_agree_frac:.0%} of the posterior lies within "
-                f"±{out.mcmc_agree_window:.2f} mag of the fitted tip -- the "
-                f"likelihood is multimodal (possible non-detection) and the "
-                f"chain's median/CI describe a different solution. MCMC CI "
-                f"excluded from the distance error; check the tip "
-                f"distributions plot.")
-        if out.railed:
-            lines.append(f"RAILED at the fit bound: "
-                         f"{escape(', '.join(out.railed))} -- corner "
-                         f"solution, no distance quoted.")
+                f"<b>TIP RAILED</b> at the {edge} fit edge ({out.tip:.2f}): "
+                f"not a likelihood maximum, so no distance is quoted. "
+                f"To fix, {fix} and re-run.")
+        shape_railed = [p for p in out.railed if p != "m_trgb"]
+        if shape_railed:
+            lines.append(
+                f"Warning: shape parameter(s) "
+                f"{escape(', '.join(shape_railed))} on a fit bound: the "
+                f"LF shape is pinned at its limit; the tip and distance are "
+                f"still quoted, treat the shape values with caution.")
         if out.expected_tip_warning:
             lines.append(f"Warning: {escape(out.expected_tip_warning)}")
         if out.support_warning:

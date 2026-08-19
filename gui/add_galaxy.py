@@ -92,7 +92,9 @@ class AddGalaxyDialog(QDialog):
         return csvs
 
     def _browse_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "Data directory", ROOT)
+        start = os.path.join(ROOT, galaxy_configs.GALAXIES_SUBDIR)
+        path = QFileDialog.getExistingDirectory(
+            self, "Data directory", start if os.path.isdir(start) else ROOT)
         if not path:
             return
         # Same convention as the galaxy.json entries: relative to the repo root

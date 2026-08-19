@@ -135,14 +135,6 @@ class MockParams:
                                      # same frame as a real catalog
 
 
-# Minimum fraction of the MCMC tip posterior that must lie near the point fit
-# for the chain to count as describing the same solution. A healthy unimodal
-# posterior keeps 50-90% of its mass within a couple of MC/bootstrap widths of
-# the optimizer's tip; when the likelihood is multimodal the chain migrates to
-# the deeper basin and the fraction collapses (DW1238M0105: 5%). Values in
-# between are rare, so the threshold is not delicate.
-MCMC_AGREE_MIN = 0.30
-
 # Convergence gates for the chain diagnostics (mcmc.chain_diagnostics).
 # Coupled emcee walkers sit at R-hat ~ 1.00 when healthy, so 1.05 is already
 # generous; N_eff is the effective independent-sample count behind the quoted
@@ -174,9 +166,6 @@ class FitOutcome:
     mcmc_chain: np.ndarray | None = None  # raw chain (steps, walkers, 4)
     mcmc_burn: int = 0                    # steps discarded as burn-in
     mcmc_diag: dict | None = None    # tau/n_eff/r_hat per param + converged
-    mcmc_agree_frac: float | None = None  # posterior mass near the point fit
-    mcmc_agree_window: float | None = None  # half-width (mag) "near" means
-    mcmc_disagrees: bool = False     # frac below MCMC_AGREE_MIN
     bg: dict | None = None           # background-subtraction report, or None
     err_budget: dict | None = None   # per-term uncertainty breakdown
     mu: float | None = None
@@ -1037,39 +1026,10 @@ class GalaxySession:
             out.mcmc_ci = (uncertainty.summarize(chain_tips, kind="MCMC",
                                                verbose=False)
                            if np.isfinite(chain_tips).any() else None)
-            if out.mcmc_ci is not None:
-                self._mcmc_agreement(out)
             out.cancelled = out.cancelled or cancel.is_set()
 
         self._distance(out, keep)
         return out
-
-    @staticmethod
-    def _mcmc_agreement(out):
-        """Fraction of the MCMC tip posterior near the point fit.
-
-        The chain samples the whole likelihood surface while the point fit
-        climbs one basin from the edge seed, so a small fraction here means
-        the posterior holds most of its mass at a DIFFERENT solution than the
-        one being quoted: a multimodal likelihood and a likely non-detection.
-        In that regime the chain's median/16/84 stop describing the fitted
-        tip (the median can sit in the valley between modes), so
-        recalculate_distance refuses the MCMC CI as the statistical term.
-
-        "Near" is within twice the photometric-MC (else bootstrap) half-width
-        of the tip, i.e. the point fit's own mode measured by the engines
-        that are local by construction; without either, a fixed 0.10 mag.
-        """
-        half = None
-        for ci in (out.mc_ci, out.boot_ci):
-            if ci is not None and np.isfinite([ci["minus"], ci["plus"]]).all():
-                half = max(ci["minus"], ci["plus"])
-                break
-        window = 0.10 if half is None else max(2.0 * half, 0.05)
-        frac = float(np.mean(np.abs(out.mcmc_tips - out.tip) <= window))
-        out.mcmc_agree_frac = frac
-        out.mcmc_agree_window = float(window)
-        out.mcmc_disagrees = frac < MCMC_AGREE_MIN
 
     def _distance(self, out, keep):
         """Extinction mean over the fitted selection, then the distance from
@@ -1086,8 +1046,10 @@ class GalaxySession:
         calibration changes.
 
         Statistical term preference (pipeline parity): photometric MC CI when
-        run, else bootstrap CI, else no error bars. A railed tip is a corner
-        solution, not a measurement: mu/D stay None.
+        run, else bootstrap CI, else no error bars. A railed TIP is a corner
+        solution, not a measurement: mu/D stay None. A railed shape
+        parameter (a/b/c on a SHAPE_BOUNDS edge) only warns, since 0 is a
+        legitimate slope value and the tip location still feeds mu.
         """
         c = self.constants
         out.m_trgb = self.m_trgb
@@ -1096,17 +1058,14 @@ class GalaxySession:
         out.mu = out.mu_minus = out.mu_plus = None
         out.dist_mpc = out.dist_minus = out.dist_plus = None
         out.err_budget = None
-        if out.railed:
+        if "m_trgb" in out.railed:
             return
         # most complete treatment wins: the MCMC posterior folds in the
         # photometric scatter (via the likelihood's error kernel) AND maps
-        # the full parameter covariance -- UNLESS the chain disagrees with
-        # the point fit (_mcmc_agreement: a multimodal posterior whose
-        # median/CI describe a different solution) or failed its
-        # convergence diagnostics (an uncertified interval must not set
-        # the quoted error bars); the local engines take over either way.
+        # the full parameter covariance. The exception is a chain that
+        # failed its convergence diagnostics (an uncertified interval must
+        # not set the quoted error bars); the local engines take over then.
         mcmc_ok = (out.mcmc_ci is not None
-                   and not out.mcmc_disagrees
                    and out.mcmc_diag is not None
                    and out.mcmc_diag.get("converged"))
         mcmc_ci = out.mcmc_ci if mcmc_ok else None
