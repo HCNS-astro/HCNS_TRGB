@@ -153,8 +153,7 @@ class AddGalaxyDialog(QDialog):
             # Discovery only scans the repo's galaxies/ folder, so an
             # out-of-repo entry would vanish on the next launch.
             problems.append("the data directory must be inside the "
-                            "repository (e.g. galaxies/<name>) -- move or "
-                            "symlink it there")
+                            "repository (e.g. galaxies/<name>)")
         for label, fname in (("photometry", phot), ("AST", ast)):
             if not fname:
                 problems.append(f"a {label} CSV is required")
