@@ -13,8 +13,11 @@ pip install -r requirements.txt
 ## Run
 
 ```sh
-python3 trgb_gui.py             
+python3 trgb_gui.py     
 ```
+
+## Load Galaxies
+To load galaxies, download photometry from the Box folder and put them in the galaxies/ folder. 
 
 ### macOS app: TODO
 
