@@ -65,7 +65,7 @@ def detect_instrument(cfg):
         candidates.append(path if os.path.isabs(path)
                           else os.path.join(cfg["data_dir"], path))
     candidates.extend(sorted(glob.glob(
-        os.path.join(cfg["data_dir"], "*.fits"))))
+        os.path.join(glob.escape(cfg["data_dir"]), "*.fits"))))
     for path in candidates:
         if not os.path.exists(path):
             continue
@@ -92,8 +92,8 @@ class FitParams:
     n_mcmc: int = 2000               # sampler steps
     n_walkers: int = 32              # emcee ensemble size (even, >= 2*ndim)
     bg_subtract: bool = False        # subtract field contamination pre-fit
-    bg_source: str = "chip"          # "chip" (--bg-chip) | "pencil" (drawn
-                                     # region, sel["bg_verts"])
+    bg_source: str = "chip"          # "chip" (off-galaxy chip) | "pencil"
+                                     # (drawn region, sel["bg_verts"])
 
     @classmethod
     def defaults_for(cls, cfg, constants):
@@ -210,6 +210,7 @@ class GalaxySession:
         self.m_trgb = float(constants["M_TRGB"])   # TRGB calibration: zero
         self.sig_cal = float(constants["SIG_CAL"])  # point + its systematic
         self.instrument = None          # detected from the DRC header
+        self.injected = None            # synthetic truth (SyntheticSession)
         self.bg_chip = None             # off-galaxy chip number (1|2), or None
         self.bg_chip_mask = None        # its stars, as a mask over self.df
         self.bg_chip_area = None        # its footprint area (arcsec^2)
@@ -252,7 +253,7 @@ class GalaxySession:
     def acs_applied(self):
         """Whether the WFC3->ACS transformation is in effect. "auto" follows
         the DRC header instrument when one was found, else the galaxy's
-        pipeline config flag (so auto == exact CLI behavior)."""
+        pipeline config flag (so auto == the pipeline's exact behavior)."""
         if self.acs_mode == "on":
             return True
         if self.acs_mode == "off":
@@ -328,10 +329,16 @@ class GalaxySession:
         same threshold (ensure_asts) so completeness/error moments describe
         the surviving sample. Returns True if the arrays changed. Refused on
         a synthetic catalog (no raw catalog to rebuild from), like
-        set_acs_mode."""
+        set_acs_mode. Raises ValueError (state untouched) when the threshold
+        would remove every star -- an empty catalog breaks every panel."""
         snr_min = None if snr_min is None else float(snr_min)
         if snr_min == self.snr_min or self._df_raw is None:
             return False
+        if (snr_min is not None and photometry.has_snr(self._df_raw)
+                and not photometry.dual_snr_mask(self._df_raw,
+                                                 snr_min).any()):
+            raise ValueError(f"S/N >= {snr_min:g} removes every star "
+                             f"in the catalog")
         self.snr_min = snr_min
         # The AST file can carry S/N columns even when this check is False
         # for the catalog, so the cached model is stale either way.
@@ -350,6 +357,13 @@ class GalaxySession:
         df = self._df_raw
         if self.snr_min is not None and photometry.has_snr(df):
             df = df[photometry.dual_snr_mask(df, self.snr_min)]
+        if not len(df):
+            # only reachable through load() (set_snr_min pre-checks): the
+            # LoadWorker turns this into a clean failure dialog
+            raise ValueError(
+                f"no stars in {self.cfg['phot']}"
+                if not len(self._df_raw) else
+                f"no stars survive the S/N >= {self.snr_min:g} cut")
         df = df.reset_index(drop=True).copy()
         if self.acs_applied():
             df["F606W_0"], df["F814W_0"] = correct_acs(df["F606W_0"],
@@ -408,8 +422,8 @@ class GalaxySession:
         ov = self.cfg.get("overlay")
         candidates = ([os.path.join(self.data_dir, ov["fits_file"])]
                       if ov and ov.get("fits_file") else [])
-        candidates += sorted(glob.glob(os.path.join(self.data_dir,
-                                                    "*.fits")))
+        candidates += sorted(glob.glob(os.path.join(
+            glob.escape(self.data_dir), "*.fits")))
         seen = set()
         mosaics = [p for p in candidates
                    if os.path.exists(p)
@@ -469,8 +483,8 @@ class GalaxySession:
 
     def _identify_chips(self):
         """Assign the catalog to the two detector chips and pick the
-        off-galaxy one as the background sample (the pipeline's --bg-chip
-        identification). A galaxy without a "chips" config entry is not
+        off-galaxy one as the background sample (the pipeline's off-galaxy
+        chip identification). A galaxy without a "chips" config entry is not
         skipped: its DRC mosaic is split automatically on load and the chips
         identified from the true pixel footprints. Failure is not an error:
         bg_available() turns False and bg_reason says why (the GUI grays the
@@ -564,12 +578,14 @@ class GalaxySession:
             candidates.append(os.path.join(cfg["data_dir"], ov["fits_file"]))
         candidates.extend(self._chip_fits_paths())
         candidates.extend(sorted(glob.glob(
-            os.path.join(cfg["data_dir"], "*.fits"))))
+            os.path.join(glob.escape(cfg["data_dir"]), "*.fits"))))
         seen = set()
         candidates = [p for p in candidates
                       if not (p in seen or seen.add(p))]
 
         ra, dec = self.cat["ra"], self.cat["dec"]
+        if ra.size == 0:
+            return None
         pad_ra = 0.02 * (ra.max() - ra.min()) or 1e-4
         pad_dec = 0.02 * (dec.max() - dec.min()) or 1e-4
         ra_lo, ra_hi = ra.min() - pad_ra, ra.max() + pad_ra
@@ -629,12 +645,18 @@ class GalaxySession:
 
     # ---------- selection (cheap; run on the GUI thread) ----------
 
-    def comp_mag_faint(self, sel, spatial):
+    def comp_mag_faint(self, sel, spatial, display=False):
         """Flat faint limit from the completeness curve, evaluated on the
         current color box WITHIN the spatial selection (pipeline parity,
         which always uses the 90% curve); sel["comp_curve"] ("comp90" |
         "comp50") lets the GUI cut at the 50% limit instead. comp90 is the
-        ml.col_comp_func piecewise model, comp50 a linear polynomial."""
+        ml.col_comp_func piecewise model, comp50 a linear polynomial.
+
+        When no selected star is fainter than the curve the cut is a no-op
+        and the result is None. ``display=True`` then falls back to the
+        curve at the bluest in-box star -- where the line WOULD sit -- so
+        e.g. the S/N cut stripping every star below the limit does not make
+        the CMD line silently vanish."""
         if self.comp is None:
             return None
         curve = sel.get("comp_curve", "comp90")
@@ -646,9 +668,10 @@ class GalaxySession:
                   & (color >= sel["color_min"])
                   & (color <= sel["color_max"]))
         below = in_box & (mag > ml.comp_limit(color, curve, coeffs))
-        if not below.any():
+        anchor = below if below.any() else (in_box if display else below)
+        if not anchor.any():
             return None
-        return float(ml.comp_limit(color[below].min(), curve, coeffs))
+        return float(ml.comp_limit(color[anchor].min(), curve, coeffs))
 
     def apply(self, sel):
         """Selection masks over the catalog: selection.py's spatial + color +
@@ -656,14 +679,21 @@ class GalaxySession:
         parity) unless switched off."""
         spatial, keep = apply_selection(self.cat, sel)
         comp_faint = None
+        comp_line = None
         n_incomplete = 0
         if sel.get("apply_comp_limit", True):
             comp_faint = self.comp_mag_faint(sel, spatial)
+            # comp_line is display-only: where to DRAW the limit even when
+            # the cut removes nothing (comp_faint None). The fit and the
+            # background sample keep keying off comp_faint.
+            comp_line = (comp_faint if comp_faint is not None
+                         else self.comp_mag_faint(sel, spatial, display=True))
             if comp_faint is not None:
                 n_incomplete = int(np.sum(keep
                                           & (self.cat["mag"] >= comp_faint)))
                 keep = keep & (self.cat["mag"] < comp_faint)
         return {"spatial": spatial, "keep": keep, "comp_faint": comp_faint,
+                "comp_line": comp_line,
                 "n_incomplete": n_incomplete,
                 "n_spatial": int(spatial.sum()), "n_keep": int(keep.sum()),
                 "n_total": int(keep.size)}
@@ -775,6 +805,11 @@ class GalaxySession:
         parity). Cached on (color box, extinction means, frame flags):
         moving the ellipse or the box invalidates the model."""
         spatial, _ = apply_selection(self.cat, sel)
+        if not spatial.any():
+            # .mean() on an empty mask is NaN, which would silently poison
+            # every dereddened model magnitude
+            raise ValueError("the spatial selection contains no stars -- "
+                             "no extinction mean to deredden the AST model")
         a606 = float(self.cat["a606"][spatial].mean())
         a814 = float(self.cat["a814"][spatial].mean())
         col_range = (sel["color_min"], sel["color_max"])
@@ -800,6 +835,12 @@ class GalaxySession:
         progress = progress or (lambda i, n, phase: None)
         cancel = cancel or threading.Event()
         out = FitOutcome()
+
+        if not params.fit_lo < params.fit_hi:
+            out.message = (f"fit range [{params.fit_lo:.2f}, "
+                           f"{params.fit_hi:.2f}] is empty -- the bright "
+                           f"limit must be less than the faint limit")
+            return out
 
         applied = self.apply(sel)
         keep = applied["keep"]
@@ -912,9 +953,20 @@ class GalaxySession:
         res, (ml_lo, ml_hi) = ml.fit_trgb_range(
             fit_mag, asts, tip0=out.edge_seed, m_bright=params.fit_lo,
             m_faint=params.fit_hi, weights=mag_w, verbose=False)
+        # EMPTY_WINDOW never optimized (res.x is still x0, the edge seed)
+        # and an unconverged Powell run is a corner solution, not a
+        # measurement -- neither may be quoted as a fitted tip.
+        if getattr(res, "status", 0) == ml.EMPTY_WINDOW:
+            out.message = (f"no usable stars in the fit window "
+                           f"[{ml_lo:.2f}, {ml_hi:.2f}] -- widen the range "
+                           f"or relax the selection cuts")
+            return out
+        if not res.success:
+            out.message = f"ML fit did not converge: {res.message}"
+            return out
         out.tip, out.a, out.b, out.c = (float(v) for v in res.x)
         out.fit_range = (float(ml_lo), float(ml_hi))
-        out.railed = list(getattr(res, "railed", []))
+        out.railed = list(res.railed)
         in_window = (fit_mag >= ml_lo) & (fit_mag <= ml_hi)
         out.n_fit = (int(in_window.sum()) if mag_w is None
                      else int(round(mag_w[in_window].sum())))
@@ -929,7 +981,10 @@ class GalaxySession:
                     _progress_cb, progress=progress, cancel=cancel,
                     phase="bootstrap..."))
             out.boot_tips = boot
-            out.boot_ci = uncertainty.summarize(boot, verbose=False)
+            # summarize raises on empty/all-NaN draws (every resample fit
+            # failed); the point fit must not be lost with them
+            out.boot_ci = (uncertainty.summarize(boot, verbose=False)
+                           if np.isfinite(boot).any() else None)
             out.cancelled = out.cancelled or boot.size < params.n_boot
 
         if params.run_mc and not cancel.is_set():
@@ -948,7 +1003,8 @@ class GalaxySession:
                     _progress_cb, progress=progress, cancel=cancel,
                     phase="photometric MC..."))
             out.mc_tips = mc
-            out.mc_ci = uncertainty.summarize(mc, verbose=False)
+            out.mc_ci = (uncertainty.summarize(mc, verbose=False)
+                         if np.isfinite(mc).any() else None)
             out.cancelled = out.cancelled or mc.size < params.n_trial
 
         if params.run_mcmc and not cancel.is_set():
@@ -980,7 +1036,7 @@ class GalaxySession:
             # cancelled inside burn-in leaves no usable samples
             out.mcmc_ci = (uncertainty.summarize(chain_tips, kind="MCMC",
                                                verbose=False)
-                           if chain_tips.size else None)
+                           if np.isfinite(chain_tips).any() else None)
             if out.mcmc_ci is not None:
                 self._mcmc_agreement(out)
             out.cancelled = out.cancelled or cancel.is_set()
@@ -1029,7 +1085,7 @@ class GalaxySession:
         is already on the outcome, so the GUI calls it again when the
         calibration changes.
 
-        Statistical term preference matches the CLI: photometric MC CI when
+        Statistical term preference (pipeline parity): photometric MC CI when
         run, else bootstrap CI, else no error bars. A railed tip is a corner
         solution, not a measurement: mu/D stay None.
         """
@@ -1045,10 +1101,15 @@ class GalaxySession:
         # most complete treatment wins: the MCMC posterior folds in the
         # photometric scatter (via the likelihood's error kernel) AND maps
         # the full parameter covariance -- UNLESS the chain disagrees with
-        # the point fit (_mcmc_agreement), in which case its median/CI
-        # describe a different (multimodal) posterior than the quoted tip
-        # and the local engines take over.
-        mcmc_ci = None if out.mcmc_disagrees else out.mcmc_ci
+        # the point fit (_mcmc_agreement: a multimodal posterior whose
+        # median/CI describe a different solution) or failed its
+        # convergence diagnostics (an uncertified interval must not set
+        # the quoted error bars); the local engines take over either way.
+        mcmc_ok = (out.mcmc_ci is not None
+                   and not out.mcmc_disagrees
+                   and out.mcmc_diag is not None
+                   and out.mcmc_diag.get("converged"))
+        mcmc_ci = out.mcmc_ci if mcmc_ok else None
         stat = (mcmc_ci if mcmc_ci is not None
                 else out.mc_ci if out.mc_ci is not None else out.boot_ci)
         out.stat_kind = ("MCMC posterior" if mcmc_ci is not None
@@ -1099,15 +1160,13 @@ class SyntheticSession(GalaxySession):
     path (CMD/sky/LF panels, selection, edge seed, ML fit, bootstrap) runs on
     data whose truth is known.
 
-    Deliberately simple: magnitudes are drawn directly from the IDEAL
-    broken power law over the requested magnitude range (MockParams
-    mag_bright/mag_faint) -- no photometric scatter, no AST
-    completeness/bias modelling -- so every star drawn lands in the catalog
-    with its exact LF magnitude. A generation range wider than the
-    selection's mag cuts simply leaves the extra stars unselected. (The ML
-    fit itself still convolves with the galaxy's AST model, as it does for
-    any catalog -- inside the fit window, where completeness is high, the
-    mismatch with these idealized data is small.)
+    The generator is MockParams' three-stage forward model (its docstring
+    is the canonical description): ideal magnitudes first, then -- each
+    stage optional, ON by default -- Gaussian scatter from the fitted AST
+    error curve and a completeness accept/reject draw. With both
+    degradation stages off, every star lands in the catalog with its exact
+    LF magnitude. A generation range wider than the selection's mag cuts
+    simply leaves the extra stars unselected.
 
     Only the F814W magnitudes carry the physics. For the LF source, colors
     are resampled from the base catalog's stars inside the current color
@@ -1122,7 +1181,6 @@ class SyntheticSession(GalaxySession):
 
     def __init__(self, base, sel, params):
         cfg = dict(base.cfg)
-        cfg["name"] = f"{cfg['name']} (synthetic)"
         # The configured distance / paper tip describe the REAL galaxy; the
         # expected-tip warning and the CMD's truth line must use the
         # injected tip instead (paper_trgb is set in load()).

@@ -24,9 +24,10 @@ class LoadWorker(QThread):
     def run(self):
         try:
             self._session.load()
-        except ValueError as exc:
-            # deliberate validation errors (e.g. synthetic-catalog inputs):
-            # the message is user-facing, a traceback is noise
+        except (ValueError, OSError) as exc:
+            # deliberate validation errors (e.g. synthetic-catalog inputs)
+            # and missing/unreadable files: the message is user-facing, a
+            # traceback is noise
             self.failed.emit(str(exc))
             return
         except Exception:
@@ -49,6 +50,10 @@ class FitWorker(QThread):
     def __init__(self, session, sel, params, parent=None):
         super().__init__(parent)
         self._session = session
+        # shallow copy: the nested vertex lists (pencil_verts, bg_verts)
+        # stay shared with the GUI thread -- safe only because
+        # SelectionControls always REPLACES those lists wholesale
+        # (set_pencil/set_bg_verts), never mutates them in place
         self._sel = dict(sel)
         self._params = params
         self._cancel = threading.Event()

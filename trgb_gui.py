@@ -23,13 +23,14 @@ def main():
     # as running from a terminal in the repo
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     galaxies, constants = config_io.load_pipeline_config()
-    initial_galaxy = (sorted(galaxies)[0] if galaxies else None)
     app = QApplication(sys.argv)
     app.setApplicationName("TRGB Finder")
     app.setWindowIcon(QIcon(os.path.join(os.path.dirname(
         os.path.abspath(__file__)), "gui", "icon.png")))
 
-    window = MainWindow(galaxies, constants, initial_galaxy=initial_galaxy)
+    # MainWindow picks the initial galaxy itself (first key, or the
+    # add-galaxy empty state when none are installed)
+    window = MainWindow(galaxies, constants)
     window.show()
     sys.exit(app.exec())
 

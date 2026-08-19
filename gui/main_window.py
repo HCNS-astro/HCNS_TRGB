@@ -208,8 +208,17 @@ class MainWindow(QMainWindow):
             self.galaxy_combo.setCurrentText(current.galaxy)
             self.galaxy_combo.blockSignals(False)
             return
-        self._set_busy(True, f"loading {galaxy}...")
+        if self._load_worker is not None and self._load_worker.isRunning():
+            # replacing the worker would drop the last reference to a live
+            # QThread and Qt aborts the process; the combo is disabled
+            # while a load runs, so only programmatic calls can get here
+            self.status_label.setText("a load is already running")
+            return
         session = GalaxySession(galaxy, self.galaxies[galaxy], self.constants)
+        self._start_load(session, f"loading {galaxy}...")
+
+    def _start_load(self, session, text):
+        self._set_busy(True, text)
         self._load_worker = LoadWorker(session)
         self._load_worker.done.connect(self._loaded)
         self._load_worker.failed.connect(self._load_failed)
@@ -226,9 +235,14 @@ class MainWindow(QMainWindow):
         self.galaxy_combo.blockSignals(True)
         self.galaxy_combo.clear()
         self.galaxy_combo.addItems(sorted(self.galaxies))
+        # Select and load explicitly: setCurrentText alone cannot be trusted
+        # to fire currentTextChanged -- rebuilding the combo already made
+        # index 0 current, so a key that sorts first (or the only key, on
+        # the first add) would be a no-op and the galaxy would never load.
+        self.galaxy_combo.setCurrentText(key)
         self.galaxy_combo.blockSignals(False)
         self.status_label.setText(f"added {key} (saved to {saved})")
-        self.galaxy_combo.setCurrentText(key)   # triggers _switch_galaxy
+        self._switch_galaxy(key)
 
     def _edit_galaxy(self):
         if self.session is None:
@@ -294,8 +308,8 @@ class MainWindow(QMainWindow):
         # state: carry the widget's current values into the fresh session.
         session.set_calibration(*self.calib_controls.current())
         cfg = session.cfg
-        injected = getattr(session, "injected", None)
-        self.sky_panel.set_catalog(session.cat, f"{cfg['name']} field")
+        injected = session.injected
+        self.sky_panel.set_catalog(session.cat, f"{session.galaxy} field")
         # fresh session: drop the old underlay, re-derive if toggled on
         self.sky_panel.set_reference(None)
         if self.sky_panel.reference_check.isChecked():
@@ -325,6 +339,8 @@ class MainWindow(QMainWindow):
         self.phot_controls.set_snr_available(session.snr_available())
         self.selection_controls.set_comp_available(session.comp is not None)
         self.selection_controls.set_selection(session.default_selection())
+        # order matters: set_params reads the availability recorded by
+        # set_bg_available to decide its chip-radio/untick fallback
         self.fit_controls.set_bg_available(session.bg_available(),
                                            session.bg_reason)
         self.fit_controls.set_params(
@@ -392,6 +408,15 @@ class MainWindow(QMainWindow):
 
     def _load_failed(self, message):
         self._set_busy(False, "")
+        # the combo already switched to the galaxy that failed to load;
+        # point it back at the session everything else still shows
+        current = self.session
+        if isinstance(current, SyntheticSession):
+            current = current._base
+        if current is not None:
+            self.galaxy_combo.blockSignals(True)
+            self.galaxy_combo.setCurrentText(current.galaxy)
+            self.galaxy_combo.blockSignals(False)
         QMessageBox.critical(self, "TRGB", f"Catalog load failed:\n{message}")
 
     def _set_busy(self, busy, text):
@@ -409,7 +434,7 @@ class MainWindow(QMainWindow):
     # ---------- photometry options ----------
 
     def _acs_mode_changed(self, mode):
-        if self.session is None or self.session.cat is None:
+        if self.session is None:
             return
         if self._busy_with_worker("changing the photometry"):
             self.phot_controls.set_acs_mode(self.session.acs_mode)
@@ -426,13 +451,16 @@ class MainWindow(QMainWindow):
                                           self.session.cfg.get("wfc3_to_acs"))
         if changed:
             # magnitudes moved: refresh the CMD background too, and any fit
-            # result no longer describes the data
+            # result no longer describes the data; the chip identification
+            # was also redone on the rebuilt arrays
             self.cmd_panel.set_catalog(self.session.cat, self.session.comp,
                                        self.session.cfg.get("paper_trgb"))
+            self.fit_controls.set_bg_available(self.session.bg_available(),
+                                               self.session.bg_reason)
             self._refresh()
 
     def _color_correct_changed(self, on):
-        if self.session is None or self.session.cat is None:
+        if self.session is None:
             return
         if self._busy_with_worker("changing the photometry"):
             self.phot_controls.set_color_correct(self.session.color_correct)
@@ -452,28 +480,44 @@ class MainWindow(QMainWindow):
                 "photometry options are locked for a synthetic catalog")
 
     def _snr_changed(self, snr_min):
-        if self.session is None or self.session.cat is None:
+        if self.session is None:
             return
         if self._busy_with_worker("changing the photometry"):
             self.phot_controls.set_snr_min(self.session.snr_min)
             return
-        if self.session.set_snr_min(snr_min):
-            # stars appeared/disappeared: both scatter backgrounds are stale
-            cfg = self.session.cfg
+        try:
+            changed = self.session.set_snr_min(snr_min)
+        except ValueError as exc:
+            # e.g. a threshold that removes every star: keep the old cut
+            self.phot_controls.set_snr_min(self.session.snr_min)
+            self.status_label.setText(f"S/N cut not applied: {exc}")
+            return
+        if changed:
+            # stars appeared/disappeared: both scatter backgrounds are
+            # stale, and the chip identification (background sample) was
+            # redone on the new arrays
             self.sky_panel.set_catalog(self.session.cat,
-                                       f"{cfg['name']} field")
+                                       f"{self.session.galaxy} field")
             self.cmd_panel.set_catalog(self.session.cat, self.session.comp,
-                                       cfg.get("paper_trgb"))
+                                       self.session.cfg.get("paper_trgb"))
+            self.fit_controls.set_bg_available(self.session.bg_available(),
+                                               self.session.bg_reason)
             self._refresh()
-        elif self.session.snr_min != (None if snr_min is None
+        elif self.session.snr_min == (None if snr_min is None
                                       else float(snr_min)):
+            # accepted, but the catalog has no S/N columns to re-cut: the
+            # AST model was still invalidated (its file can carry S/N
+            # columns the catalog lacks), so the next fit may use a
+            # different completeness/error model -- mark the outcome stale
+            self._refresh()
+        else:
             # refused: a synthetic catalog is frozen in its generation frame
             self.phot_controls.set_snr_min(self.session.snr_min)
             self.status_label.setText(
                 "photometry options are locked for a synthetic catalog")
 
     def _calibration_changed(self):
-        if self.session is None or self.session.cat is None:
+        if self.session is None:
             return
         if self._busy_with_worker("changing the calibration"):
             self.calib_controls.set_values(self.session.m_trgb,
@@ -496,31 +540,33 @@ class MainWindow(QMainWindow):
                 self.lf_panel.mark_stale()
 
     def _arm_sub_capture(self):
-        if self.session is None or self.session.cat is None:
+        if self.session is None:
             return
         self.sky_panel.request_sub_capture()
         self.status_label.setText(
             "draw the subtraction region on the sky panel "
-            "(left button drag)")
+            "(left button drag; right click cancels)")
 
     def _arm_bg_capture(self):
-        if self.session is None or self.session.cat is None:
+        if self.session is None:
             return
         self.sky_panel.request_bg_capture()
         self.status_label.setText(
             "draw the background-sample region on the sky panel "
-            "(left button drag) -- keep it away from the galaxy")
+            "(left button drag; right click cancels) -- keep it away "
+            "from the galaxy")
 
     # ---------- reference image underlay ----------
 
     def _toggle_reference(self, on):
-        if self.session is None or self.session.cat is None:
+        if self.session is None:
             return
         if not on:
             self.sky_panel.set_reference(None)
             return
         self.status_label.setText("loading reference image...")
-        self.status_label.repaint()
+        self.status_label.repaint()   # forced paint: the load below blocks
+                                      # the GUI thread, so update() won't show
         ref = self.session.reference_image()
         if ref is None:
             self.sky_panel.reference_check.blockSignals(True)
@@ -539,7 +585,7 @@ class MainWindow(QMainWindow):
     # ---------- live selection refresh ----------
 
     def _refresh(self, mark_stale=True):
-        if self.session is None or self.session.cat is None:
+        if self.session is None:
             return
         sel = self.selection_controls.current_selection()
         applied = self.session.apply(sel)
@@ -555,23 +601,28 @@ class MainWindow(QMainWindow):
                                         bg_mask=None if bg is None
                                         else bg["mask"])
         self.cmd_panel.update_selection(self.session.cat, keep, sel,
-                                        applied["comp_faint"], tip)
+                                        applied["comp_line"], tip)
         self.lf_panel.update_selection(self.session.cat["mag"][keep],
                                        applied["comp_faint"], m_grid, edge,
                                        bg=bg)
         # Synthetic catalogs: flag the panel title and overlay the
         # theoretical LF the data was drawn from, rescaled to the current
         # selection.
-        injected = getattr(self.session, "injected", None)
+        injected = self.session.injected
         self.lf_panel.set_synthetic(injected is not None)
         if injected:
             self.lf_panel.show_truth(
                 self.session.truth_lf(keep, applied["comp_faint"], sel))
         else:
             self.lf_panel.show_truth(None)
-        comp_note = ("" if applied["comp_faint"] is None else
-                     f" | completeness cut {applied['comp_faint']:.2f} "
-                     f"(−{applied['n_incomplete']} stars)")
+        if applied["comp_faint"] is not None:
+            comp_note = (f" | completeness cut {applied['comp_faint']:.2f} "
+                         f"(−{applied['n_incomplete']} stars)")
+        elif applied["comp_line"] is not None:
+            comp_note = (f" | completeness limit {applied['comp_line']:.2f} "
+                         f"(no stars below it)")
+        else:
+            comp_note = ""
         self.status_label.setText(
             f"selected {applied['n_keep']} / {applied['n_total']} stars "
             f"(spatial {applied['n_spatial']}){comp_note}")
@@ -591,6 +642,9 @@ class MainWindow(QMainWindow):
         sel = self.selection_controls.current_selection()
         self._fit_sel = sel     # what the outcome will describe
         self.fit_controls.run_button.setEnabled(False)
+        # BIN_WIDTH feeds the worker's edge-seed grid through the shared
+        # constants dict, so it must not move mid-fit
+        self.lf_panel.bin_spin.setEnabled(False)
         self.results.show_progress(0, 0, "starting...")
         self._fit_worker = FitWorker(self.session, sel, params)
         self._fit_worker.progress.connect(self.results.show_progress)
@@ -610,6 +664,7 @@ class MainWindow(QMainWindow):
 
     def _fit_done(self, outcome):
         self.fit_controls.run_button.setEnabled(True)
+        self.lf_panel.bin_spin.setEnabled(True)
         self.results.hide_progress()
         if not outcome.success:
             self.results.show_outcome(outcome)
@@ -641,6 +696,7 @@ class MainWindow(QMainWindow):
 
     def _fit_failed(self, message):
         self.fit_controls.run_button.setEnabled(True)
+        self.lf_panel.bin_spin.setEnabled(True)
         self.results.hide_progress()
         QMessageBox.critical(self, "TRGB", f"Fit failed:\n{message}")
 
@@ -660,7 +716,7 @@ class MainWindow(QMainWindow):
         AST cache. The model is cached after any fit with this color box, so
         the usual open is instant; a first open loads the AST CSV on the GUI
         thread (a second or two, like the reference underlay)."""
-        if self.session is None or self.session.cat is None:
+        if self.session is None:
             return
         if self._busy_with_worker("inspecting the AST model"):
             return
@@ -668,7 +724,7 @@ class MainWindow(QMainWindow):
         applied = self.session.apply(sel)
         params = self.fit_controls.current_params()
         self.status_label.setText("loading AST model...")
-        self.status_label.repaint()
+        self.status_label.repaint()   # forced paint, as in _toggle_reference
         try:
             asts = self.session.ensure_asts(sel)
         except Exception as exc:
@@ -685,7 +741,7 @@ class MainWindow(QMainWindow):
             asts, self.session.cat["mag"][applied["keep"]],
             applied["comp_faint"], params.fit_lo, params.fit_hi,
             self.constants["BIN_WIDTH"], tip=tip,
-            name=self.session.cfg["name"])
+            name=self.session.galaxy)
         self._ast_dialog.show()
         self._ast_dialog.raise_()
         self._refresh(mark_stale=False)   # restore the selection status line
@@ -696,7 +752,7 @@ class MainWindow(QMainWindow):
         """Generate ONE synthetic sample and load it as the working catalog
         (SyntheticSession), through the same worker path as a galaxy switch:
         every panel and the fit then operate on the fake data."""
-        if self.session is None or self.session.cat is None:
+        if self.session is None:
             return
         if self._busy_with_worker("generating a synthetic catalog"):
             return
@@ -705,12 +761,7 @@ class MainWindow(QMainWindow):
         if isinstance(base, SyntheticSession):
             base = base._base       # regenerate from the real galaxy
         session = SyntheticSession(base, sel, params)
-        self._set_busy(True, "generating synthetic catalog...")
-        self._load_worker = LoadWorker(session)
-        self._load_worker.done.connect(self._loaded)
-        self._load_worker.failed.connect(self._load_failed)
-        self._load_worker.finished.connect(self._clear_load_worker)
-        self._load_worker.start()
+        self._start_load(session, "generating synthetic catalog...")
 
     # ---------- persistence ----------
 
@@ -719,6 +770,15 @@ class MainWindow(QMainWindow):
 
     def _save_selection(self):
         if self.session is None:
+            return
+        if isinstance(self.session, SyntheticSession):
+            # _selection_path points into the REAL galaxy's data dir, and
+            # the file auto-loads on its next real load
+            QMessageBox.information(
+                self, "TRGB",
+                "Not saved: a synthetic catalog is loaded, and saving would "
+                "overwrite the real galaxy's saved selection. Reload the "
+                "galaxy first.")
             return
         sel = self.selection_controls.current_selection()
         payload = config_io.selection_payload(
@@ -735,6 +795,10 @@ class MainWindow(QMainWindow):
     def _load_selection(self):
         if self.session is None:
             return
+        # blocked as a whole: applying the file mid-fit would half-apply it
+        # (the photometry/calibration handlers each hit the busy guard)
+        if self._busy_with_worker("loading a selection"):
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Load selection", self.session.data_dir, "JSON (*.json)")
         if not path:
@@ -744,46 +808,59 @@ class MainWindow(QMainWindow):
     def _apply_selection_file(self, path):
         """Load a saved selection file into the controls: the manual "Load
         selection" path and the automatic restore on galaxy load."""
+        # the file is user-editable and auto-loaded on every galaxy load,
+        # so any parse/shape/IO surprise must end as a dialog, not an
+        # uncaught slot exception
         try:
             sel, fit, payload = config_io.load_selection(path)
-        except (KeyError, ValueError) as exc:
+            # each option needs both calls below: the set_* widget setters
+            # block signals, so the session-side handler must be run manually
+            if payload.get("acs_mode"):
+                self.phot_controls.set_acs_mode(payload["acs_mode"])
+                self._acs_mode_changed(payload["acs_mode"])
+            if "color_correct" in payload:
+                self.phot_controls.set_color_correct(payload["color_correct"])
+                self._color_correct_changed(payload["color_correct"])
+            if "snr_min" in payload:
+                self.phot_controls.set_snr_min(payload["snr_min"])
+                self._snr_changed(payload["snr_min"])
+            calib = payload.get("calibration")
+            if calib:
+                self.calib_controls.set_values(calib["m_trgb"],
+                                               calib["sig_cal"])
+                self._calibration_changed()
+            self.selection_controls.set_selection(sel)
+            if fit:
+                # keys absent from the file fall back to the FitParams
+                # dataclass defaults
+                kwargs = {k: fit[k] for k in
+                          ("n_boot", "run_mc", "n_trial", "run_mcmc",
+                           "n_mcmc", "n_walkers", "bg_subtract", "bg_source")
+                          if k in fit}
+                if "range" in fit:
+                    kwargs["fit_lo"], kwargs["fit_hi"] = fit["range"]
+                self.fit_controls.set_params(FitParams(**kwargs))
+        except Exception as exc:
             QMessageBox.critical(self, "TRGB",
-                                 f"Could not read {path}:\n{exc}")
+                                 f"Could not apply {path}:\n{exc}")
             return
-        if payload.get("acs_mode"):
-            self.phot_controls.set_acs_mode(payload["acs_mode"])
-            self._acs_mode_changed(payload["acs_mode"])
-        if "color_correct" in payload:
-            self.phot_controls.set_color_correct(payload["color_correct"])
-            self._color_correct_changed(payload["color_correct"])
-        if "snr_min" in payload:
-            self.phot_controls.set_snr_min(payload["snr_min"])
-            self._snr_changed(payload["snr_min"])
-        calib = payload.get("calibration")
-        if calib:
-            self.calib_controls.set_values(calib["m_trgb"], calib["sig_cal"])
-            self._calibration_changed()
-        self.selection_controls.set_selection(sel)
-        if fit:
-            self.fit_controls.set_params(FitParams(
-                fit_lo=fit.get("range", [23.0, 25.5])[0],
-                fit_hi=fit.get("range", [23.0, 25.5])[1],
-                n_boot=fit.get("n_boot", 500),
-                run_mc=fit.get("run_mc", False),
-                n_trial=fit.get("n_trial", 1000),
-                run_mcmc=fit.get("run_mcmc", False),
-                n_mcmc=fit.get("n_mcmc", 2000),
-                n_walkers=fit.get("n_walkers", 32),
-                bg_subtract=fit.get("bg_subtract", False),
-                bg_source=fit.get("bg_source", "chip")))
         self.status_label.setText(f"loaded {path}")
 
     # ---------- shutdown ----------
 
     def closeEvent(self, event):
-        if self._fit_worker is not None and self._fit_worker.isRunning():
-            self._fit_worker.cancel()
-            self._fit_worker.wait(5000)
-        if self._load_worker is not None and self._load_worker.isRunning():
-            self._load_worker.wait(5000)
+        # A QThread destroyed while running aborts the process, so never
+        # proceed past a live worker: cancel what can be cancelled, then
+        # block until it finishes (the point fit and a first-time load's
+        # chip split are uncancellable but bounded).
+        for worker in (self._fit_worker, self._load_worker):
+            if worker is None or not worker.isRunning():
+                continue
+            if isinstance(worker, FitWorker):
+                worker.cancel()
+            if not worker.wait(5000):
+                self.status_label.setText(
+                    "waiting for background work to finish...")
+                self.status_label.repaint()
+                worker.wait()
         super().closeEvent(event)

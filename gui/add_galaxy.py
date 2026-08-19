@@ -6,8 +6,10 @@ import glob
 import os
 
 import pandas as pd
+
+import galaxy_configs
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog,
-                               QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+                               QDialogButtonBox, QFileDialog,
                                QFormLayout, QHBoxLayout, QLineEdit,
                                QMessageBox, QPushButton)
 
@@ -18,7 +20,7 @@ class AddGalaxyDialog(QDialog):
     """Modal form for one new galaxy; galaxy_config() gives (key, cfg) after
     accept(). Pass ``edit=(key, cfg)`` to modify an existing galaxy instead:
     the form is pre-filled, the key is locked, and config keys the form does
-    not cover (chips, fit_range, ...) are preserved on save."""
+    not cover (dm, chips, fit_range, ...) are preserved on save."""
 
     def __init__(self, existing_keys, parent=None, edit=None):
         super().__init__(parent)
@@ -29,13 +31,10 @@ class AddGalaxyDialog(QDialog):
         form = QFormLayout(self)
 
         self.key_edit = QLineEdit()
-        self.key_edit.setPlaceholderText("short id, e.g. dw2 (used in the "
-                                         "galaxy list and on the CLI)")
+        self.key_edit.setPlaceholderText("short id, e.g. dw2 (names the "
+                                         "galaxy everywhere; auto-filled "
+                                         "from the data folder)")
         form.addRow("Galaxy ID", self.key_edit)
-
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("display name (defaults to the ID)")
-        form.addRow("Name", self.name_edit)
 
         self.dir_edit = QLineEdit()
         browse = QPushButton("Browse...")
@@ -53,19 +52,6 @@ class AddGalaxyDialog(QDialog):
         self.ast_combo.setEditable(True)
         form.addRow("AST CSV", self.ast_combo)
 
-        self.dm_check = QCheckBox("known")
-        self.dm_spin = QDoubleSpinBox()
-        self.dm_spin.setRange(15.0, 40.0)
-        self.dm_spin.setDecimals(2)
-        self.dm_spin.setSingleStep(0.01)
-        self.dm_spin.setValue(28.0)
-        self.dm_spin.setEnabled(False)
-        self.dm_check.toggled.connect(self.dm_spin.setEnabled)
-        dm_row = QHBoxLayout()
-        dm_row.addWidget(self.dm_check)
-        dm_row.addWidget(self.dm_spin)
-        form.addRow("Distance modulus", dm_row)
-
         self.acs_check = QCheckBox("apply WFC3→ACS transformation "
                                    "(when no DRC header is found)")
         form.addRow(self.acs_check)
@@ -82,24 +68,21 @@ class AddGalaxyDialog(QDialog):
             self._orig_cfg = dict(cfg)
             self.setWindowTitle("Edit galaxy")
             self.key_edit.setText(key)
-            self.key_edit.setEnabled(False)   # the key names files/CLI runs
-            self.name_edit.setText(cfg.get("name", key))
+            self.key_edit.setEnabled(False)   # the key names files/configs
             self.dir_edit.setText(cfg["data_dir"])
             folder = (cfg["data_dir"] if os.path.isabs(cfg["data_dir"])
                       else os.path.join(ROOT, cfg["data_dir"]))
             self._populate_csvs(folder)
             self.phot_combo.setCurrentText(cfg["phot"])
             self.ast_combo.setCurrentText(cfg["ast"])
-            if cfg.get("dm") is not None:
-                self.dm_check.setChecked(True)
-                self.dm_spin.setValue(float(cfg["dm"]))
             self.acs_check.setChecked(bool(cfg.get("wfc3_to_acs")))
 
     def _populate_csvs(self, path):
         """Fill both file combos with the directory's CSVs, keeping a still-
         valid current choice."""
         csvs = sorted(os.path.basename(p)
-                      for p in glob.glob(os.path.join(path, "*.csv")))
+                      for p in glob.glob(os.path.join(glob.escape(path),
+                                                      "*.csv")))
         for combo in (self.phot_combo, self.ast_combo):
             current = combo.currentText()
             combo.clear()
@@ -116,6 +99,11 @@ class AddGalaxyDialog(QDialog):
         # (the GUI runs with cwd there) when the directory is inside it.
         rel = os.path.relpath(path, ROOT)
         self.dir_edit.setText(path if rel.startswith("..") else rel)
+        # Autofill the ID from the folder name (the discover() default for
+        # hand-made configs) unless the user already typed one. Edit mode
+        # locks the key, so leave it alone there.
+        if self.key_edit.isEnabled() and not self.key_edit.text().strip():
+            self.key_edit.setText(os.path.basename(os.path.normpath(path)))
         csvs = self._populate_csvs(path)
         # Common naming: pre-select an AST-looking file for the AST box and
         # steer the photometry box AWAY from it -- alphabetically
@@ -154,6 +142,18 @@ class AddGalaxyDialog(QDialog):
             # out-of-repo entry would vanish on the next launch.
             problems.append("the data directory must be inside the "
                             "repository (e.g. galaxies/<name>)")
+        else:
+            # Discovery scans exactly one level: <root>/galaxies/<name> and
+            # <root>/<name>. Anything else (../, nested dirs) would save
+            # fine and then silently vanish on the next launch.
+            parts = os.path.normpath(data_dir).split(os.sep)
+            if not (len(parts) == 1 and parts[0] not in ("..", ".")
+                    or len(parts) == 2
+                    and parts[0] == galaxy_configs.GALAXIES_SUBDIR):
+                problems.append(
+                    "the data directory must be a direct subfolder of "
+                    "galaxies/ (or of the repo root) -- deeper or ../ "
+                    "paths are not discovered on the next launch")
         for label, fname in (("photometry", phot), ("AST", ast)):
             if not fname:
                 problems.append(f"a {label} CSV is required")
@@ -194,15 +194,18 @@ class AddGalaxyDialog(QDialog):
         key = self.key_edit.text().strip()
         cfg = dict(self._orig_cfg)
         cfg.update({
-            "name": self.name_edit.text().strip() or key,
             "data_dir": self.dir_edit.text().strip(),
             "phot": self.phot_combo.currentText().strip(),
             "ast": self.ast_combo.currentText().strip(),
         })
-        if self.dm_check.isChecked():
-            cfg["dm"] = self.dm_spin.value()
-        else:
-            cfg.pop("dm", None)
+        if (self._edit_key is not None
+                and cfg["data_dir"] != self._orig_cfg.get("data_dir")):
+            # the field-geometry keys describe the OLD directory's imaging;
+            # kept, they would silently mis-place the chip masks, the
+            # background sample and the aperture center on the new data
+            for k in ("chips", "chip_fits", "chip_areas", "overlay",
+                      "ellipse", "ellipse_px"):
+                cfg.pop(k, None)
         if self.acs_check.isChecked():
             cfg["wfc3_to_acs"] = True
         else:

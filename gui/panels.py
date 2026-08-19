@@ -10,8 +10,8 @@ literally shared; both are framed to the same CMD_YLIM constant and pinned to
 the same fixed vertical figure margins (ALIGN_TOP/ALIGN_BOTTOM, instead of
 constrained layout, which would allocate different top space for the LF's
 second x-axis), and their widget stacks lose the same pixels above and below
-the canvas (the LF's bin-width row is mirrored by an equal-height spacer on
-the CMD panel), so the two magnitude scales line up row-for-row on screen.
+the canvas (the LF's bin-width row and the CMD's isochrone-controls row share
+one fixed height), so the two magnitude scales line up row-for-row on screen.
 """
 
 import numpy as np
@@ -41,8 +41,8 @@ BAND_ALPHA = 0.08
 # docstring); the top leaves room for the LF's twiny labels + title
 ALIGN_TOP = 0.86
 ALIGN_BOTTOM = 0.08
-# height of the LF panel's bin-width row AND the CMD panel's matching
-# spacer: both canvases must lose the same pixels for the axes to align
+# height of the LF panel's bin-width row AND the CMD panel's isochrone
+# row: both canvases must lose the same pixels for the axes to align
 BOTTOM_ROW_H = 30
 
 
@@ -221,6 +221,8 @@ class SkyPanel(MplPanel):
         self._lasso = None              # active while the pencil tool is on
         self._capture_sub = False       # next stroke = subtraction region
         self._capture_bg = False        # next stroke = background sample
+        self._tool_wants_lasso = False  # spatial tool's own mode, so a
+                                        # cancelled capture can restore it
         self._ref = None                # AxesImage underlay, set_reference
         self._aspect = 1.0
         self.reference_check = QCheckBox("reference image")
@@ -234,8 +236,12 @@ class SkyPanel(MplPanel):
         self.canvas.mpl_connect("button_press_event", self._on_click)
 
     def _on_click(self, event):
+        if event.button == 3 and self.cancel_capture():
+            return      # right click disarms a pending one-shot capture
+        # toolbar.mode is non-empty while pan/zoom is active: their
+        # right-drag gestures must not recenter the ellipse
         if (event.inaxes is self.ax and event.button == 3
-                and event.xdata is not None):
+                and event.xdata is not None and not self.toolbar.mode):
             self.recentered.emit(float(event.xdata), float(event.ydata))
 
     def set_pencil_mode(self, on):
@@ -243,28 +249,43 @@ class SkyPanel(MplPanel):
         the pencil is the active spatial tool -- or while a one-shot
         subtraction capture is pending -- so ordinary clicks and the
         right-click recenter keep working otherwise."""
-        if on and self._lasso is None:
-            self._lasso = LassoSelector(self.ax, onselect=self._pencil_done,
-                                        button=1,
-                                        props={"color": "C2", "lw": 1.5})
-        elif (not on and self._lasso is not None
+        self._tool_wants_lasso = bool(on)
+        if on:
+            self._arm_lasso()
+        elif (self._lasso is not None
               and not self._capture_sub and not self._capture_bg):
             self._lasso.disconnect_events()
             self._lasso.set_visible(False)
             self._lasso = None
 
+    def _arm_lasso(self):
+        if self._lasso is None:
+            self._lasso = LassoSelector(self.ax, onselect=self._pencil_done,
+                                        button=1,
+                                        props={"color": "C2", "lw": 1.5})
+
     def request_sub_capture(self):
         """Arm the lasso for ONE stroke that defines the subtraction
         region; afterwards the lasso returns to whatever the spatial tool
-        requires."""
+        requires. Right click cancels the pending capture."""
         self._capture_sub = True
-        self.set_pencil_mode(True)
+        self._arm_lasso()
 
     def request_bg_capture(self):
         """Arm the lasso for ONE stroke that defines the background
         sample region (ML fit box), like request_sub_capture."""
         self._capture_bg = True
-        self.set_pencil_mode(True)
+        self._arm_lasso()
+
+    def cancel_capture(self):
+        """Disarm a pending one-shot capture (armed strokes otherwise
+        persist indefinitely: the NEXT left-drag, however much later, would
+        silently become the region). Returns True if one was pending."""
+        if not (self._capture_sub or self._capture_bg):
+            return False
+        self._capture_sub = self._capture_bg = False
+        self.set_pencil_mode(self._tool_wants_lasso)
+        return True
 
     def _pencil_done(self, verts):
         if len(verts) < 3:
@@ -285,6 +306,9 @@ class SkyPanel(MplPanel):
     def set_catalog(self, cat, title):
         self.ax.set_title(title)
         self._all.set_offsets(np.column_stack([cat["ra"], cat["dec"]]))
+        if cat["ra"].size == 0:      # nothing to frame; .max() would raise
+            self.redraw()
+            return
         self.ax.set_xlim(cat["ra"].max(), cat["ra"].min())   # RA increases left
         self.ax.set_ylim(cat["dec"].min(), cat["dec"].max())
         self._aspect = 1.0 / np.cos(np.radians(np.median(cat["dec"])))
@@ -385,10 +409,18 @@ class CmdPanel(MplPanel):
         self.iso_dm_spin.setToolTip(
             "Distance modulus applied to the isochrone overlays (seeded "
             "from the galaxy's dm config value). Display only.")
+        self.edge_check = QCheckBox("edge tip")
+        self.edge_check.setChecked(True)
+        self.edge_check.setToolTip(
+            "Draw the edge detector's tip estimate (the peak of the "
+            "response the LF panel plots) as a line on the CMD. "
+            "Display only.")
+        self.edge_check.toggled.connect(self._toggle_edge_line)
         row_w = QWidget()
         row_w.setFixedHeight(BOTTOM_ROW_H)
         row = QHBoxLayout(row_w)
         row.setContentsMargins(4, 0, 4, 0)
+        row.addWidget(self.edge_check)
         row.addWidget(QLabel("isochrone [M/H]"))
         self._iso_check_row = QHBoxLayout()
         self._iso_check_row.setContentsMargins(0, 0, 0, 0)
@@ -417,6 +449,7 @@ class CmdPanel(MplPanel):
         self._ml = _TipOverlay(self.ax)
         self._paper_line = self.ax.axhline(np.nan, color="C4", lw=1, ls=":",
                                            label="paper TRGB")
+        self._edge_tip_mag = np.nan         # last estimate, for the toggle
         self._isochrones = {}
         self._iso_lines = {}    # label -> Line2D, rebuilt per galaxy
         self._iso_checks = {}   # label -> QCheckBox in the bottom row
@@ -440,6 +473,20 @@ class CmdPanel(MplPanel):
                    if _drawn(a)]
         self.ax.legend(handles=handles, loc="upper left", fontsize=7)
 
+    def _apply_edge_line(self):
+        """Sync the estimate line to the stored value and the checkbox,
+        without redrawing."""
+        on = bool(self.edge_check.isChecked()
+                  and np.isfinite(self._edge_tip_mag))
+        self._edge_line.set_visible(on)
+        if on:
+            self._edge_line.set_ydata([self._edge_tip_mag] * 2)
+
+    def _toggle_edge_line(self):
+        self._apply_edge_line()
+        self._refresh_legend()
+        self.redraw()
+
     def set_catalog(self, cat, comp, paper_trgb, paper_label="paper TRGB"):
         self._paper_line.set_label(paper_label)
         self._all.set_offsets(np.column_stack([cat["color"], cat["mag"]]))
@@ -455,6 +502,8 @@ class CmdPanel(MplPanel):
         if paper_trgb is not None:
             self._paper_line.set_ydata([paper_trgb, paper_trgb])
         self._ml.hide()
+        self._edge_tip_mag = np.nan     # stale estimate of the old catalog
+        self._apply_edge_line()
         self.ax.set_ylim(*self.constants["CMD_YLIM"])
         self._refresh_legend()
         self.redraw()
@@ -468,9 +517,8 @@ class CmdPanel(MplPanel):
         self._comp_cut.set_visible(comp_faint is not None)
         if comp_faint is not None:
             self._comp_cut.set_ydata([comp_faint, comp_faint])
-        self._edge_line.set_visible(np.isfinite(edge_tip_mag))
-        if np.isfinite(edge_tip_mag):
-            self._edge_line.set_ydata([edge_tip_mag, edge_tip_mag])
+        self._edge_tip_mag = float(edge_tip_mag)
+        self._apply_edge_line()
         self._refresh_legend()
         self.redraw()
 
@@ -525,9 +573,12 @@ class CmdPanel(MplPanel):
         self._update_isochrone()
 
     def set_isochrone_rectified(self, on):
-        """Track the session's color-correction state so the overlays live
-        in the same magnitude plane as the plotted catalog."""
+        """Track the session's color-correction state so the overlays AND
+        the axis label live in the same magnitude plane as the plotted
+        catalog."""
         self._iso_rectified = bool(on)
+        self.ax.set_ylabel("F814W$_0$ (color-rectified)" if on
+                           else "F814W$_0$")
         self._update_isochrone()
 
     def _update_isochrone(self, *_):
@@ -573,12 +624,13 @@ class LfEdgePanel(MplPanel):
         self.bin_spin.setDecimals(2)
         self.bin_spin.setValue(constants["BIN_WIDTH"])
         self.bin_spin.setToolTip(
-            "Histogram bin width for the LF plot [mag]. Display only: the "
-            "ML fit is unbinned, so this does not change fit results. The "
+            "Histogram bin width for the LF plot [mag]. The ML fit is "
+            "unbinned; only the edge-seed grid's completeness anchoring "
+            "uses this width, so results shift at most marginally. The "
             "model/truth overlays rescale to match the new bin counts.")
         # a fixed-height row BELOW the canvas (the toolbar overflows at the
-        # panel's usual widths and would hide the control); the CMD panel
-        # carries an equal-height spacer so the canvases stay the same size
+        # panel's usual widths and would hide the control); the CMD panel's
+        # isochrone row has the same height so the canvases stay equal
         row_w = QWidget()
         row_w.setFixedHeight(BOTTOM_ROW_H)
         row = QHBoxLayout(row_w)
@@ -850,6 +902,14 @@ class AstModelDialog(QDialog):
         ax.clear()
         m_obs, m_true, comp_true, err_kernel, _ = ml.build_model_grid(
             asts, m_min=fit_lo, m_max=fit_hi)
+        if m_obs.size == 0 or m_true.size == 0:
+            # a window entirely outside the AST validity range grids empty
+            ax.set_title(f"{name} fit window [{fit_lo:.2f}, {fit_hi:.2f}] "
+                         f"lies outside the AST validity range "
+                         f"[{asts.mag_range[0]:.2f}, "
+                         f"{asts.mag_range[1]:.2f}]".strip(), fontsize=9)
+            self.kernel_panel.redraw()
+            return
         # sqrt color scale: the bright end's narrow Gaussians tower over the
         # faint end's wide ones on a linear scale, hiding the very fading
         # (sigma growth + completeness death) the panel exists to show

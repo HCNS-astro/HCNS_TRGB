@@ -158,16 +158,14 @@ class PhotometryControls(QGroupBox):
             "so no S/N cut can be applied -- same as the pipeline, which "
             "passes such catalogs through unchanged.")
 
-    def acs_mode(self):
-        return self._MODES[self.acs_combo.currentIndex()]
-
     def set_acs_mode(self, mode):
+        # a bad mode string (hand-edited selection file) must not leave
+        # the combo's signals permanently blocked
         self.acs_combo.blockSignals(True)
-        self.acs_combo.setCurrentIndex(self._MODES.index(mode))
-        self.acs_combo.blockSignals(False)
-
-    def color_correct(self):
-        return self.color_correct_check.isChecked()
+        try:
+            self.acs_combo.setCurrentIndex(self._MODES.index(mode))
+        finally:
+            self.acs_combo.blockSignals(False)
 
     def set_color_correct(self, on):
         self.color_correct_check.blockSignals(True)
@@ -445,40 +443,46 @@ class SelectionControls(QGroupBox):
 
     def set_selection(self, sel):
         """Load a selection dict, rebasing the center offsets to zero."""
+        # a malformed dict (hand-edited selection file, e.g. an unknown
+        # "mode") must not leave the group's changed signal permanently
+        # blocked -- that would silently freeze every control
         self.blockSignals(True)
-        self._ra0, self._dec0 = sel["ra_cen"], sel["dec_cen"]
-        self.dra.set_value(0.0)
-        self.ddec.set_value(0.0)
-        self.a.set_value(sel["a"])
-        self.b.set_value(sel["b"])
-        self.pa.set_value(sel["pa"])
-        {"inside": self.mode_inside, "outside": self.mode_outside,
-         "off": self.mode_off}[sel.get("mode", "inside")].setChecked(True)
-        self.inner_subtract.setChecked(sel.get("inner_subtract", False))
-        self.a_in.set_value(sel.get("a_in", 10.0))
-        self.b_in.set_value(sel.get("b_in", 10.0))
-        self._pencil_verts = sel.get("pencil_verts") or None
-        self._pencil_sub_verts = sel.get("pencil_sub_verts") or None
-        self._bg_verts = sel.get("bg_verts") or None
-        # order matters: setting the pencil-subtract box last lets its
-        # mutual-exclusion handler win if a (hand-edited) file has both
-        self.pencil_sub_check.setChecked(sel.get("pencil_subtract", False))
-        (self.tool_pencil if sel.get("spatial_tool") == "pencil"
-         else self.tool_ellipse).setChecked(True)
-        self._tool_changed()    # sync the enabled states to the tool
-        self.a_in.setEnabled(self.inner_subtract.isChecked())
-        self.b_in.setEnabled(self.inner_subtract.isChecked())
-        for w in (self.pencil_sub_draw, self.pencil_sub_clear):
-            w.setEnabled(self.pencil_sub_check.isChecked())
-        self.color_min.set_value(sel["color_min"])
-        self.color_max.set_value(sel["color_max"])
-        self.mag_bright.set_value(sel["mag_bright"])
-        self.mag_faint.set_value(sel["mag_faint"])
-        self.comp_limit.setChecked(sel.get("apply_comp_limit", True))
-        self.comp_curve.setCurrentIndex(
-            1 if sel.get("comp_curve", "comp90") == "comp50" else 0)
-        self._sync_abs()
-        self.blockSignals(False)
+        try:
+            self._ra0, self._dec0 = sel["ra_cen"], sel["dec_cen"]
+            self.dra.set_value(0.0)
+            self.ddec.set_value(0.0)
+            self.a.set_value(sel["a"])
+            self.b.set_value(sel["b"])
+            self.pa.set_value(sel["pa"])
+            {"inside": self.mode_inside, "outside": self.mode_outside,
+             "off": self.mode_off}[sel.get("mode", "inside")].setChecked(True)
+            self.inner_subtract.setChecked(sel.get("inner_subtract", False))
+            self.a_in.set_value(sel.get("a_in", 10.0))
+            self.b_in.set_value(sel.get("b_in", 10.0))
+            self._pencil_verts = sel.get("pencil_verts") or None
+            self._pencil_sub_verts = sel.get("pencil_sub_verts") or None
+            self._bg_verts = sel.get("bg_verts") or None
+            # order matters: setting the pencil-subtract box last lets its
+            # mutual-exclusion handler win if a (hand-edited) file has both
+            self.pencil_sub_check.setChecked(sel.get("pencil_subtract",
+                                                     False))
+            (self.tool_pencil if sel.get("spatial_tool") == "pencil"
+             else self.tool_ellipse).setChecked(True)
+            self._tool_changed()    # sync the enabled states to the tool
+            self.a_in.setEnabled(self.inner_subtract.isChecked())
+            self.b_in.setEnabled(self.inner_subtract.isChecked())
+            for w in (self.pencil_sub_draw, self.pencil_sub_clear):
+                w.setEnabled(self.pencil_sub_check.isChecked())
+            self.color_min.set_value(sel["color_min"])
+            self.color_max.set_value(sel["color_max"])
+            self.mag_bright.set_value(sel["mag_bright"])
+            self.mag_faint.set_value(sel["mag_faint"])
+            self.comp_limit.setChecked(sel.get("apply_comp_limit", True))
+            self.comp_curve.setCurrentIndex(
+                1 if sel.get("comp_curve", "comp90") == "comp50" else 0)
+            self._sync_abs()
+        finally:
+            self.blockSignals(False)
         self.changed.emit()
 
     def recenter(self, ra, dec):
@@ -610,6 +614,12 @@ class FitControls(QGroupBox):
         self.fit_hi = QDoubleSpinBox()
         self.fit_hi.setRange(16.0, 30.0)
         self.fit_hi.setSingleStep(0.1)
+        # keep the window non-empty: each limit clamps the other's range
+        # (an inverted window would otherwise be fit/shown as "valid")
+        self.fit_lo.valueChanged.connect(
+            lambda v: self.fit_hi.setMinimum(v + 0.1))
+        self.fit_hi.valueChanged.connect(
+            lambda v: self.fit_lo.setMaximum(v - 0.1))
         form.addRow("bright limit", self.fit_lo)
         form.addRow("faint limit", self.fit_hi)
 
@@ -657,8 +667,9 @@ class FitControls(QGroupBox):
             "window, completeness faint limit), are area-scaled to the "
             "selection aperture, and that many stars are removed from the "
             "galaxy sample per fine magnitude bin. The sample is the whole "
-            "off-galaxy detector chip (the pipeline's --bg-chip) or a "
-            "freehand pencil region drawn on the sky panel.")
+            "off-galaxy detector chip (identified automatically, as the "
+            "pipeline does) or a freehand pencil region drawn on the sky "
+            "panel.")
         self.bg_subtract.setToolTip(self._bg_tooltip)
         form.addRow(self.bg_subtract)
 
@@ -693,8 +704,9 @@ class FitControls(QGroupBox):
         self._chip_available = True
         self.bg_subtract.toggled.connect(self._bg_ui_sync)
         self.bg_pencil_radio.toggled.connect(self._bg_ui_sync)
-        # the pencil radio alone covers source flips (the exclusive pair
-        # toggles together -- both connected would refresh twice)
+        # bg_chip_radio is deliberately NOT connected to bgChanged: the
+        # exclusive pair toggles together, so the pencil radio alone covers
+        # source flips (both connected would refresh twice)
         self.bg_subtract.toggled.connect(lambda *_: self.bgChanged.emit())
         self.bg_pencil_radio.toggled.connect(lambda *_: self.bgChanged.emit())
         self.bg_draw.clicked.connect(self.bgDrawRequested)
@@ -726,7 +738,7 @@ class FitControls(QGroupBox):
             self.bg_pencil_radio.setChecked(True)
         self.bg_chip_radio.setToolTip(
             "Use the whole off-galaxy detector chip as the background "
-            "sample (the pipeline's --bg-chip)." if available else
+            "sample (the pipeline's default)." if available else
             f"Unavailable -- {reason}")
         self._bg_ui_sync()
 
@@ -914,10 +926,12 @@ class MockControls(QGroupBox):
             "Generate a synthetic sample with this seed and load it as the "
             "working catalog: the CMD, sky and LF panels, the selection cuts "
             "and “Run fit” all operate on the fake data, with the injected "
-            "tip marked on the CMD. Colors and sky positions are cosmetic "
-            "(resampled from the real catalog / drawn in the current "
-            "ellipse) -- only the F814W magnitudes carry the physics. "
-            "Toolbar “Reload” returns to the real galaxy.")
+            "tip marked on the CMD. For the LF source, colors are cosmetic "
+            "(resampled from the real catalog) and only the F814W "
+            "magnitudes carry the physics; a PARSEC catalog brings its own "
+            "physical colors. Sky positions are always synthetic (drawn in "
+            "the current ellipse). Toolbar “Reload” returns to the real "
+            "galaxy.")
         form.addRow(self.generate_button)
         self.generate_button.clicked.connect(
             lambda: self.generateRequested.emit(self.current_params()))
@@ -975,7 +989,9 @@ class MockControls(QGroupBox):
 def _variance_share(mn, pl, out):
     """A term's fraction of the total variance (term^2 / sigma_mu^2) per
     side, or "" when no total is quoted."""
-    if out.mu_minus is None:
+    if out.mu_minus is None or not (out.mu_minus and out.mu_plus):
+        # mu_minus/plus can be exactly 0 (degenerate CI of identical tips
+        # with sig_cal set to 0): no shares of a zero total
         return ""
     return (f"{mn ** 2 / out.mu_minus ** 2:.0%} / "
             f"{pl ** 2 / out.mu_plus ** 2:.0%}")

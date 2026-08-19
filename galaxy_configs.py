@@ -1,6 +1,7 @@
 """Galaxy configuration discovery and shared pipeline constants
 
-Required: "phot" and "ast" (the CSV filenames); "name" defaults to the key.
+Required: "phot" and "ast" (the CSV filenames). The key (folder name unless
+the file sets "key") identifies the galaxy everywhere, display included.
 """
 
 import json
@@ -80,9 +81,7 @@ def discover(root=ROOT):
                 continue
             key = str(cfg.pop("key", entry))
             cfg["data_dir"] = data_dir
-            cfg.setdefault("name", key)
             if key in found:
-                
                 raise RuntimeError(
                     f"duplicate galaxy key {key!r}: declared by both "
                     f"{found[key]['data_dir']}/{CONFIG_FILE} and "
