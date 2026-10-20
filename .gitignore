@@ -42,3 +42,4 @@ dist/
 mocks/answers/
 *.gif
 *.mp4
+PARSEC_mock_*.dat
