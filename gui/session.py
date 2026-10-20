@@ -203,6 +203,7 @@ class GalaxySession:
         self.bg_chip = None             # off-galaxy chip number (1|2), or None
         self.bg_chip_mask = None        # its stars, as a mask over self.df
         self.bg_chip_area = None        # its footprint area (arcsec^2)
+        self._bg_footprint = None       # ("fits", path) | ("box", box)
         self.bg_reason = "catalog not loaded yet"
         self._auto_chips = None         # cached auto-split outcome
         self._df_raw = None             # full catalog: no S/N cut, no ACS
@@ -481,8 +482,10 @@ class GalaxySession:
         self.bg_chip = None
         self.bg_chip_mask = None
         self.bg_chip_area = None
+        self._bg_footprint = None
         cfg = self.cfg
         auto_areas = None
+        chip_fits = None
         try:
             if "chips" in cfg:
                 chip_fits = self._chip_fits_paths()
@@ -530,6 +533,11 @@ class GalaxySession:
         # the chip-2 box) means chip 2 is the background field.
         self.bg_chip = 2 if on1 else 1
         self.bg_chip_mask = np.asarray(m2 if on1 else m1, dtype=bool)
+        # how membership was decided, for bg_chip_contains
+        if chip_fits and all(os.path.exists(p) for p in chip_fits):
+            self._bg_footprint = ("fits", chip_fits[self.bg_chip - 1])
+        else:
+            self._bg_footprint = ("box", cfg["chips"][self.bg_chip - 1])
         # Measured footprint area when the config carries one; the box 4ab
         # circumscribes the drizzled footprint and runs ~9-11% high.
         if "chip_areas" in cfg:
@@ -545,6 +553,18 @@ class GalaxySession:
         """Whether the off-galaxy-chip background sample exists; when False,
         bg_reason says why (for the grayed-out toggle's tooltip)."""
         return self.bg_chip is not None
+
+    def bg_chip_contains(self, ra, dec):
+        """Boolean mask: which arbitrary (ra, dec) points (degrees) land on
+        the off-galaxy chip, by the same footprint that assigned the
+        catalog's stars to it (the split chip's finite pixels, else its
+        rotated box). For measuring region areas on the chip by sampling."""
+        points = pd.DataFrame({"ra": np.asarray(ra, dtype=float),
+                               "dec": np.asarray(dec, dtype=float)})
+        kind, spec = self._bg_footprint
+        if kind == "fits":
+            return photometry.chip_footprint_mask(points, spec)
+        return photometry.rotated_box_mask(points, *spec)
 
     # ---------- reference image (sky-panel underlay) ----------
 
@@ -625,6 +645,12 @@ class GalaxySession:
             "img": np.nan_to_num(np.clip(scaled, 0.0, 1.0), nan=0.0),
             "extent": (ra_lo, ra_hi, dec_lo, dec_hi)}
         return self._ref_image
+
+    def default_fit_params(self, constants):
+        """The fit parameters the GUI starts from for this catalog: the
+        config's fit window (else ml.FIT_RANGE) and the pipeline's
+        resampling sizes. Derived sessions override this."""
+        return FitParams.defaults_for(self.cfg, constants)
 
     def default_selection(self):
         sel = default_selection(self.cfg, self.cat)
@@ -874,6 +900,8 @@ class GalaxySession:
                 sel, applied["comp_faint"], source=bg_source,
                 spatial=applied["spatial"])
             src_desc = ("the drawn background region" if bg_source == "pencil"
+                        else "the CMD file's background sample"
+                        if self.bg_chip == "file"
                         else f"off-galaxy chip {self.bg_chip}")
             if bg_mag.size == 0:
                 out.bg = {"used": False, "source": bg_source,
@@ -938,6 +966,19 @@ class GalaxySession:
                 f"selection bright cut at {sel['mag_bright']:.3f}: the model "
                 f"expects stars where the selection allows none. Align the "
                 f"window with the cuts before trusting any result.")
+
+        # Same floor as the selection and background gates, applied to
+        # the stars the likelihood will actually see: the window can hold
+        # a handful of stars (or, weighted, one) when the tip sits at the
+        # image depth, and Powell will still "converge" on them.
+        in_window = (fit_mag >= params.fit_lo) & (fit_mag <= params.fit_hi)
+        n_window = (int(in_window.sum()) if mag_w is None
+                    else int(round(mag_w[in_window].sum())))
+        if n_window < 10:
+            out.message = (f"only {n_window} stars in the fit window "
+                           f"[{params.fit_lo:.2f}, {params.fit_hi:.2f}]; "
+                           f"nothing to fit")
+            return out
 
         progress(0, 0, "fitting (ML point estimate)...")
         res, (ml_lo, ml_hi) = ml.fit_trgb_range(
@@ -1408,3 +1449,181 @@ class SyntheticSession(GalaxySession):
         phi_obs = (phi_ideal * self._comp_curve(m) if inj["completeness"]
                    else None)
         return {"m": m, "phi_ideal": phi_ideal, "phi_obs": phi_obs}
+
+
+# Columns a CMD-only file must carry (dereddened apparent magnitudes).
+CMD_COLUMNS = ("F606W", "F814W")
+
+
+def read_cmd_file(path):
+    """(table, meta) of a CMD-only catalog: a CSV with F606W and F814W
+    columns (dereddened apparent magnitudes) and, optionally, e_F814W and a
+    0/1 ``bg`` column flagging the rows that are the background sample
+    rather than the science CMD. Leading ``# key = value`` comment lines
+    carry the metadata make_mocks.py writes (galaxy, a606, a814, color,
+    bg_scale); every key is optional."""
+    meta = {}
+    with open(path) as f:
+        for line in f:
+            if not line.startswith("#"):
+                break
+            if "=" in line:
+                key, value = line.lstrip("#").split("=", 1)
+                meta[key.strip()] = value.strip()
+    tbl = pd.read_csv(path, comment="#")
+    missing = [c for c in CMD_COLUMNS if c not in tbl.columns]
+    if missing:
+        raise ValueError(
+            f"{os.path.basename(path)} is missing column(s) "
+            f"{', '.join(missing)} -- a CMD file needs F606W and F814W "
+            f"columns (optionally e_F814W and a 0/1 bg flag)")
+    return tbl, meta
+
+
+class CmdSession(GalaxySession):
+    """A session whose catalog is a bare CMD file (read_cmd_file): two
+    magnitudes per star and no sky positions, e.g. a make_mocks.py mock.
+
+    Everything the CMD cannot supply comes from the galaxy that was loaded
+    when the file was opened (``base``): the AST model, the completeness
+    limit, the photometric frame and the calibration. The file's magnitudes
+    are taken as already dereddened; the extinction means that deredden
+    the AST model are the file's a606/a814 metadata, else the base
+    catalog's means.
+
+    There is no spatial selection: every star sits at one dummy position
+    and the default selection has the ellipse off (the GUI hides the sky
+    panel and the spatial tools). The background sample, when the file has
+    ``bg`` rows, stands in for the off-galaxy chip, scaled by the file's
+    bg_scale (science area / background area; 1 when absent).
+
+    Built like a real session: construct, then load() from a LoadWorker.
+    Reloading the galaxy from the toolbar returns to the real catalog.
+    """
+
+    def __init__(self, base, path):
+        cfg = dict(base.cfg)
+        # The configured distance / paper tip describe the REAL galaxy.
+        cfg.pop("dm", None)
+        cfg.pop("paper_trgb", None)
+        super().__init__(f"{os.path.basename(path)} (CMD file)", cfg,
+                         base.constants)
+        self._base = base
+        self.path = path
+        # Same photometric frame as the base session so the fit's AST model
+        # (ensure_asts) is built consistently.
+        self.acs_mode = base.acs_mode
+        self.color_correct = base.color_correct
+        self.snr_min = base.snr_min
+        self.m_trgb = base.m_trgb
+        self.sig_cal = base.sig_cal
+        self.instrument = base.instrument
+        self.meta = {}
+        self._bg = None                 # {"color", "mag"} of the bg rows
+        self._bg_scale = 1.0
+        self._color = None              # the file's color box, if it has one
+
+    def load(self):
+        base = self._base
+        tbl, meta = read_cmd_file(self.path)
+        self.meta = meta
+        made_for = meta.get("galaxy")
+        if made_for and made_for != base.galaxy:
+            raise ValueError(
+                f"{os.path.basename(self.path)} was generated with the ASTs "
+                f"of {made_for}, but {base.galaxy} is loaded -- select "
+                f"{made_for} in the galaxy box first, then load the CMD")
+        try:
+            a606 = float(meta.get("a606", base.cat["a606"].mean()))
+            a814 = float(meta.get("a814", base.cat["a814"].mean()))
+            self._bg_scale = float(meta.get("bg_scale", 1.0))
+            if "color" in meta:
+                lo, hi = (float(v) for v in meta["color"].split(","))
+                self._color = (lo, hi)
+        except ValueError:
+            raise ValueError(
+                f"{os.path.basename(self.path)}: unreadable '# key = value' "
+                f"metadata line (a606, a814, bg_scale take one number, "
+                f"color takes 'min, max')") from None
+
+        tbl = tbl[np.isfinite(tbl["F606W"]) & np.isfinite(tbl["F814W"])]
+        color = (tbl["F606W"] - tbl["F814W"]).to_numpy(float)
+        mag = tbl["F814W"].to_numpy(float)
+        if self.color_correct:
+            mag = photometry.color_correct(mag, color)
+        is_bg = (tbl["bg"].to_numpy() > 0 if "bg" in tbl.columns
+                 else np.zeros(len(tbl), dtype=bool))
+        sci = ~is_bg
+        n = int(sci.sum())
+        if n == 0:
+            raise ValueError(f"{os.path.basename(self.path)} has no science "
+                             f"rows (every row is flagged bg)")
+        # without an error column, a small nominal width for the edge
+        # detector's kernel
+        err = (tbl["e_F814W"].to_numpy(float)[sci]
+               if "e_F814W" in tbl.columns else np.full(n, 0.05))
+        self.cat = {"ra": np.zeros(n), "dec": np.zeros(n),
+                    "color": color[sci], "mag": mag[sci], "err": err,
+                    "a606": np.full(n, a606), "a814": np.full(n, a814)}
+        self.comp = base.comp
+        if is_bg.any():
+            self._bg = {"color": color[is_bg], "mag": mag[is_bg]}
+            self.bg_chip = "file"
+            self.bg_reason = ""
+        else:
+            self.bg_reason = ("the CMD file has no background rows (a 0/1 "
+                              "bg column)")
+        return self
+
+    def default_selection(self):
+        """The base galaxy's CMD cuts with the ellipse off (no positions);
+        the file's own color box when its metadata names one."""
+        sel = self._base.default_selection()
+        sel.update({"mode": "off", "spatial_tool": "ellipse",
+                    "ra_cen": 0.0, "dec_cen": 0.0})
+        if self._color is not None:
+            sel["color_min"], sel["color_max"] = self._color
+        return sel
+
+    # Bright edge of a CMD file's default fit window. A blind test gives no
+    # distance to center ml.FIT_RANGE on, so the window spans the whole
+    # plausible tip range down to the selection's faint cut.
+    FIT_LO = 22.0
+
+    def default_fit_params(self, constants):
+        """A wide fit window ([FIT_LO, the selection's mag_faint]) and the
+        file's background sample subtracted when it has one -- the fixed
+        ml.FIT_RANGE would clip a tip fainter than ~25 and report a wrong
+        tip from a handful of stars."""
+        params = FitParams.defaults_for(self.cfg, constants)
+        sel = self.default_selection()
+        spatial = np.ones(self.cat["mag"].size, dtype=bool)
+        comp_faint = (self.comp_mag_faint(sel, spatial)
+                      if sel.get("apply_comp_limit") else None)
+        params.fit_lo = self.FIT_LO
+        params.fit_hi = float(min(sel["mag_faint"],
+                                  comp_faint if comp_faint is not None
+                                  else np.inf))
+        params.bg_subtract = self.bg_available()
+        params.bg_source = "chip"
+        return params
+
+    def reference_image(self, n_grid=700):
+        return None
+
+    def _bg_sample(self, sel, comp_faint, source="chip", spatial=None):
+        """The file's background rows under the selection's CMD cuts, scaled
+        by the file's bg_scale. ``cut`` is all False: no catalog star is a
+        background star."""
+        color, mag = self._bg["color"], self._bg["mag"]
+        cut = ((color >= sel["color_min"]) & (color <= sel["color_max"])
+               & (mag >= sel["mag_bright"]) & (mag <= sel["mag_faint"]))
+        if comp_faint is not None:
+            cut &= mag < comp_faint
+        return (mag[cut], self._bg_scale, "",
+                np.zeros(self.cat["mag"].size, dtype=bool))
+
+    def bg_preview(self, sel, comp_faint, source):
+        if source != "chip" or not self.bg_available():
+            return None
+        return super().bg_preview(sel, comp_faint, source)

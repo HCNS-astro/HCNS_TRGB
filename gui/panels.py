@@ -49,8 +49,13 @@ BOTTOM_ROW_H = 30
 def _tip_errors(outcome):
     """(minus, plus) 16/84-percentile errors on the fitted tip, preferring
     the photometric-MC CI over the bootstrap CI (recalculate_distance's
-    order). None when neither resampling ran."""
-    ci = outcome.mc_ci if outcome.mc_ci is not None else outcome.boot_ci
+    order). The MCMC posterior CI is the last resort: it lands here only
+    when the budget refused to certify it (failed convergence diagnostics)
+    and nothing else ran -- the band is still worth seeing then, alongside
+    the convergence warning in the results text. None when no engine ran."""
+    ci = (outcome.mc_ci if outcome.mc_ci is not None
+          else outcome.boot_ci if outcome.boot_ci is not None
+          else outcome.mcmc_ci)
     if ci is None:
         return None
     return float(ci["minus"]), float(ci["plus"])

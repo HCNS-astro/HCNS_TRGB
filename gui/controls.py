@@ -201,6 +201,7 @@ class SelectionControls(QGroupBox):
         form = QFormLayout(self)
 
         tool_row = QWidget()
+        self._form = form
         tool_layout = QHBoxLayout(tool_row)
         tool_layout.setContentsMargins(0, 0, 0, 0)
         self.tool_ellipse = QRadioButton("ellipse")
@@ -341,6 +342,14 @@ class SelectionControls(QGroupBox):
         comp_layout.addWidget(self.comp_limit, 1)
         comp_layout.addWidget(self.comp_curve)
         form.addRow(comp_row)
+
+        # every row that only makes sense with sky positions
+        # (set_spatial_visible)
+        self._spatial_rows = (tool_row, self.dra, self.ddec, self.ra_abs,
+                              self.dec_abs, self.a, self.b, self.ab_link,
+                              self.pa, mode_row, self.inner_subtract,
+                              self.a_in, self.b_in, self.pencil_sub_check,
+                              sub_row)
 
         for w in (self.dra, self.ddec, self.a, self.b, self.pa,
                   self.a_in, self.b_in,
@@ -521,6 +530,13 @@ class SelectionControls(QGroupBox):
         self.ddec.set_value(0.0)
         self._sync_abs()
         self.changed.emit()
+
+    def set_spatial_visible(self, visible):
+        """Show/hide the spatial rows (tool, ellipse, subtraction regions).
+        Hidden for a CMD-only catalog, which has no positions to select
+        on -- its selection keeps the ellipse mode "off"."""
+        for row in self._spatial_rows:
+            self._form.setRowVisible(row, bool(visible))
 
     def set_comp_available(self, available):
         self.comp_limit.setEnabled(available)
@@ -727,6 +743,7 @@ class FitControls(QGroupBox):
         form.addRow(bg_row)
 
         self._chip_available = True
+        self._pencil_available = True
         self.bg_subtract.toggled.connect(self._bg_ui_sync)
         self.bg_pencil_radio.toggled.connect(self._bg_ui_sync)
         # bg_chip_radio is deliberately NOT connected to bgChanged: the
@@ -746,9 +763,11 @@ class FitControls(QGroupBox):
     def _bg_ui_sync(self, *_):
         """Enabled states follow the toggle + source: the chip radio needs
         identified chips, the draw/clear buttons need the pencil source."""
+        self.bg_subtract.setEnabled(self._chip_available
+                                    or self._pencil_available)
         on = self.bg_subtract.isChecked()
         self.bg_chip_radio.setEnabled(on and self._chip_available)
-        self.bg_pencil_radio.setEnabled(on)
+        self.bg_pencil_radio.setEnabled(on and self._pencil_available)
         pencil = self.bg_pencil_radio.isChecked()
         self.bg_draw.setEnabled(on and pencil)
         self.bg_clear.setEnabled(on and pencil)
@@ -760,11 +779,25 @@ class FitControls(QGroupBox):
         available (a drawn region needs no chips)."""
         self._chip_available = bool(available)
         if not available and self.bg_chip_radio.isChecked():
-            self.bg_pencil_radio.setChecked(True)
+            if self._pencil_available:
+                self.bg_pencil_radio.setChecked(True)
+            else:
+                self.bg_subtract.setChecked(False)
         self.bg_chip_radio.setToolTip(
             "Use the whole off-galaxy detector chip as the background "
             "sample (the pipeline's default)." if available else
             f"Unavailable -- {reason}")
+        self._bg_ui_sync()
+
+    def set_cmd_only(self, on):
+        """CMD-only catalog (no sky positions): the pencil source cannot be
+        drawn, and the "chip" source is the file's own background rows.
+        Call before set_bg_available, which settles the radio fallback."""
+        self._pencil_available = not on
+        self.bg_chip_radio.setText("file bg sample" if on
+                                   else "off-galaxy chip")
+        if on:
+            self.bg_chip_radio.setChecked(True)
         self._bg_ui_sync()
 
     def set_params(self, params: FitParams):
@@ -777,15 +810,18 @@ class FitControls(QGroupBox):
         self.mcmc.setChecked(params.run_mcmc)
         self.n_mcmc.setValue(params.n_mcmc)
         self.n_walkers.setValue(params.n_walkers)
-        if params.bg_source == "pencil" or not self._chip_available:
+        pencil = self._pencil_available and (params.bg_source == "pencil"
+                                             or not self._chip_available)
+        if pencil:
             self.bg_pencil_radio.setChecked(True)
         else:
             self.bg_chip_radio.setChecked(True)
         # a chip-sourced request without identified chips cannot run: untick
         # rather than silently re-pointing it at a (possibly undrawn) region
         self.bg_subtract.setChecked(
-            params.bg_subtract and (params.bg_source == "pencil"
-                                    or self._chip_available))
+            params.bg_subtract
+            and ((params.bg_source == "pencil" and self._pencil_available)
+                 or self._chip_available))
         self._bg_ui_sync()
 
     def current_params(self):
@@ -1198,6 +1234,7 @@ class ResultsPanel(QWidget):
                 note = (f" &nbsp; Warning: {escape(b['note'])}"
                         if b.get("note") else "")
                 src = ("pencil region" if b.get("source") == "pencil"
+                       else "file sample" if b["chip"] == "file"
                        else f"chip {b['chip']}")
                 lines.append(f"background: {src}, {b['n_bg']} stars"
                              f" × scale {b['scale']:.4f} → removed "

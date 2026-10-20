@@ -1,4 +1,5 @@
-"""Worker threads for the slow session operations (catalog load, ML fit).
+"""Worker threads for the slow session operations (catalog load, ML fit,
+mock generation).
 
 Workers only touch the session object (pure numpy/pandas) and communicate with
 the GUI thread through signals carrying plain Python objects; no Qt widget is
@@ -9,6 +10,8 @@ import threading
 import traceback
 
 from PySide6.QtCore import QThread, Signal
+
+import make_mocks
 
 
 class LoadWorker(QThread):
@@ -71,3 +74,38 @@ class FitWorker(QThread):
             return
         self.done.emit(outcome)
 
+
+
+class MockWorker(QThread):
+    """Runs make_mocks.generate (loads every chosen galaxy, then writes the
+    mock CMD files) with progress + cooperative cancel between mocks."""
+
+    progress = Signal(int, int, str)    # (i, n, phase) -- n=0: indeterminate
+    done = Signal(object)               # generate()'s result dict
+    failed = Signal(str)
+
+    def __init__(self, galaxies, constants, kwargs, parent=None):
+        super().__init__(parent)
+        self._galaxies = galaxies
+        self._constants = constants
+        self._kwargs = kwargs
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
+
+    def run(self):
+        try:
+            result = make_mocks.generate(
+                galaxies=self._galaxies, constants=self._constants,
+                progress=self.progress.emit, cancel=self._cancel,
+                **self._kwargs)
+        except (ValueError, OSError) as exc:
+            # unusable inputs (no off-galaxy chip, missing file, ...): the
+            # message is user-facing, a traceback is noise
+            self.failed.emit(str(exc))
+            return
+        except Exception:
+            self.failed.emit(traceback.format_exc(limit=3))
+            return
+        self.done.emit(result)

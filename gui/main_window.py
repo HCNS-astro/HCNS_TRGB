@@ -13,15 +13,20 @@ import isochrones
 
 from . import config_io
 from .add_galaxy import AddGalaxyDialog
+from .mock_dialog import MakeMocksDialog
 from .controls import (CalibrationControls, FitControls, MockControls,
                        PhotometryControls, ResultsPanel, SelectionControls,
                        UncertaintyPanel)
 from .panels import (AstModelDialog, CmdPanel, LfEdgePanel, SkyPanel,
                      TipDistributionDialog)
-from .session import FitParams, GalaxySession, SyntheticSession
-from .workers import FitWorker, LoadWorker
+from .session import CmdSession, FitParams, GalaxySession, SyntheticSession
+from .workers import FitWorker, LoadWorker, MockWorker
 
 DEBOUNCE_MS = 75
+
+# Sessions built on top of a loaded galaxy (their ``_base``) rather than
+# read from its catalog; the galaxy combo keeps naming the base.
+DERIVED = (SyntheticSession, CmdSession)
 
 
 class MainWindow(QMainWindow):
@@ -37,6 +42,7 @@ class MainWindow(QMainWindow):
         self._outcome_stale = False
         self._load_worker = None
         self._fit_worker = None
+        self._mock_worker = None
         self._fit_sel = None        # the selection the running fit captured
         self._tip_dialog = None     # lazily created TipDistributionDialog
         self._ast_dialog = None     # lazily created AstModelDialog
@@ -60,6 +66,22 @@ class MainWindow(QMainWindow):
         self.reload_action = toolbar.addAction("Reload")
         self.save_action = toolbar.addAction("Save selection")
         self.load_action = toolbar.addAction("Load selection")
+        self.cmd_action = toolbar.addAction("Load CMD…")
+        self.cmd_action.setToolTip(
+            "Open a CMD-only catalog (CSV with F606W and F814W columns, no "
+            "sky positions), e.g. a make_mocks.py mock, as the working "
+            "catalog. The AST model, completeness limit and calibration "
+            "come from the galaxy currently loaded; the sky panel and the "
+            "spatial tools are hidden. Toolbar “Reload” returns to the "
+            "galaxy.")
+        self.mocks_action = toolbar.addAction("Make mocks…")
+        self.mocks_action.setToolTip(
+            "Generate a blind-test set of mock CMDs (make_mocks.py): a "
+            "PARSEC population at a grid of distance moduli and masses, "
+            "degraded with the chosen images' completeness, photometric "
+            "errors and off-galaxy-chip contaminants. Writes mock_NNN.csv "
+            "files for “Load CMD…” and, outside that folder, the answer "
+            "sheet.")
         self.ast_action = toolbar.addAction("View AST…")
         self.ast_action.setToolTip(
             "Plot the AST model the ML fit relies on -- completeness C(m), "
@@ -134,6 +156,8 @@ class MainWindow(QMainWindow):
             lambda: self._switch_galaxy(self.galaxy_combo.currentText()))
         self.save_action.triggered.connect(self._save_selection)
         self.load_action.triggered.connect(self._load_selection)
+        self.cmd_action.triggered.connect(self._load_cmd)
+        self.mocks_action.triggered.connect(self._make_mocks)
         self.ast_action.triggered.connect(self._show_ast_model)
         self.phot_controls.acsModeChanged.connect(self._acs_mode_changed)
         self.phot_controls.colorCorrectChanged.connect(
@@ -202,7 +226,7 @@ class MainWindow(QMainWindow):
             return
         if self._busy_with_worker("switching galaxies"):
             current = self.session
-            if isinstance(current, SyntheticSession):
+            if isinstance(current, DERIVED):
                 current = current._base    # the combo lists real keys only
             self.galaxy_combo.blockSignals(True)
             self.galaxy_combo.setCurrentText(current.galaxy)
@@ -309,11 +333,29 @@ class MainWindow(QMainWindow):
         session.set_calibration(*self.calib_controls.current())
         cfg = session.cfg
         injected = session.injected
-        self.sky_panel.set_catalog(session.cat, f"{session.galaxy} field")
+        derived = isinstance(session, DERIVED)
+        # A CMD-only catalog has no positions: no sky panel, no spatial
+        # tools, and the only background source is the file's own sample.
+        cmd_only = isinstance(session, CmdSession)
+        # Name the working catalog where it stays visible through a fit:
+        # the galaxy box keeps naming the base image, and the results
+        # banner is replaced by the fit's own text.
+        label = (f"{os.path.basename(session.path)} (CMD file, "
+                 f"{session._base.galaxy} model)" if cmd_only
+                 else f"{session.galaxy} (synthetic)" if injected
+                 else session.galaxy)
+        self.setWindowTitle(f"TRGB: {label}")
+        self.cmd_panel.ax.set_title(f"CMD: {label}")
+        self.sky_panel.setVisible(not cmd_only)
+        self.selection_controls.set_spatial_visible(not cmd_only)
+        self.fit_controls.set_cmd_only(cmd_only)
         # fresh session: drop the old underlay, re-derive if toggled on
         self.sky_panel.set_reference(None)
-        if self.sky_panel.reference_check.isChecked():
-            self._toggle_reference(True)
+        if not cmd_only:
+            self.sky_panel.set_catalog(session.cat,
+                                       f"{session.galaxy} field")
+            if self.sky_panel.reference_check.isChecked():
+                self._toggle_reference(True)
         self.cmd_panel.set_catalog(session.cat, session.comp,
                                    cfg.get("paper_trgb"),
                                    paper_label=("injected TRGB" if injected
@@ -344,7 +386,7 @@ class MainWindow(QMainWindow):
         self.fit_controls.set_bg_available(session.bg_available(),
                                            session.bg_reason)
         self.fit_controls.set_params(
-            FitParams.defaults_for(cfg, self.constants))
+            session.default_fit_params(self.constants))
         # Sensible starting point for the synthetic-data test: the galaxy's
         # expected tip (configured distance + calibration), else the paper's.
         if cfg.get("dm") is not None:
@@ -381,6 +423,17 @@ class MainWindow(QMainWindow):
                 f"{truth}. Press “Run fit” and compare the "
                 f"fitted tip to the injected one (dotted line on the CMD). "
                 f"Toolbar “Reload” returns to the real galaxy.")
+        elif cmd_only:
+            bg = session._bg
+            bg_text = (f"{bg['mag'].size} background stars "
+                       f"(scale {session._bg_scale:.4f})" if bg is not None
+                       else "no background sample")
+            self.results.text.setText(
+                f"<b>CMD file</b> {os.path.basename(session.path)}: "
+                f"{session.cat['mag'].size} stars, {bg_text}; AST model, "
+                f"completeness and calibration from {session._base.galaxy}. "
+                f"No sky positions, so the sky panel and spatial tools are "
+                f"hidden. Toolbar “Reload” returns to the real galaxy.")
         else:
             self.results.text.setText("No fit yet. Adjust the selection "
                                       "and press “Run fit”.")
@@ -388,21 +441,21 @@ class MainWindow(QMainWindow):
         self._set_busy(False, "")
         if iso_note:
             self.status_label.setText(iso_note)
-        # A synthetic catalog is frozen in the photometric frame it was
-        # generated in (the session refuses changes -- the fit's AST model
-        # would otherwise be built in a frame the data are not in); gray
-        # the box out so the lock is visible.
-        self.phot_controls.setEnabled(not injected)
+        # A synthetic or CMD-file catalog is frozen in the photometric
+        # frame it was built in (the session refuses changes -- the fit's
+        # AST model would otherwise be built in a frame the data are not
+        # in); gray the box out so the lock is visible.
+        self.phot_controls.setEnabled(not derived)
         self.phot_controls.setToolTip(
-            "Photometry options are locked for a synthetic catalog -- the "
-            "data were generated in the current frame. Toolbar “Reload” "
-            "returns to the real galaxy." if injected else "")
+            "Photometry options are locked for a synthetic or CMD-file "
+            "catalog -- the data were built in the current frame. Toolbar "
+            "“Reload” returns to the real galaxy." if derived else "")
         # Restore this galaxy's saved selection automatically (the manual
         # "Load selection" remains for arbitrary files). Synthetic sessions
         # skip it: they must keep the selection the data was generated
         # under, not the real galaxy's saved one.
         saved = self._selection_path()
-        if not injected and os.path.exists(saved):
+        if not derived and os.path.exists(saved):
             self._apply_selection_file(saved)
         self._refresh()
 
@@ -411,7 +464,7 @@ class MainWindow(QMainWindow):
         # the combo already switched to the galaxy that failed to load;
         # point it back at the session everything else still shows
         current = self.session
-        if isinstance(current, SyntheticSession):
+        if isinstance(current, DERIVED):
             current = current._base
         if current is not None:
             self.galaxy_combo.blockSignals(True)
@@ -423,7 +476,8 @@ class MainWindow(QMainWindow):
         for w in (self.phot_controls, self.selection_controls,
                   self.fit_controls,
                   self.calib_controls, self.mock_controls,
-                  self.save_action, self.load_action, self.ast_action,
+                  self.save_action, self.load_action, self.cmd_action,
+                  self.mocks_action, self.ast_action,
                   self.reload_action,
                   self.add_galaxy_action, self.edit_galaxy_action,
                   self.remove_galaxy_action, self.galaxy_combo):
@@ -659,8 +713,11 @@ class MainWindow(QMainWindow):
             self._fit_worker = None
 
     def _cancel_fit(self):
+        """The progress bar's Stop: cancels whichever worker drives it."""
         if self._fit_worker is not None and self._fit_worker.isRunning():
             self._fit_worker.cancel()
+        if self._mock_worker is not None and self._mock_worker.isRunning():
+            self._mock_worker.cancel()
 
     def _fit_done(self, outcome):
         self.fit_controls.run_button.setEnabled(True)
@@ -758,10 +815,89 @@ class MainWindow(QMainWindow):
             return
         sel = self.selection_controls.current_selection()
         base = self.session
-        if isinstance(base, SyntheticSession):
+        if isinstance(base, DERIVED):
             base = base._base       # regenerate from the real galaxy
+        if isinstance(self.session, CmdSession):
+            # a CMD file's selection has no aperture to place the stars in
+            sel = base.default_selection()
         session = SyntheticSession(base, sel, params)
         self._start_load(session, "generating synthetic catalog...")
+
+    # ---------- CMD-only catalogs ----------
+
+    def _load_cmd(self):
+        """Open a CMD-only file as the working catalog (CmdSession), on top
+        of the galaxy currently loaded, through the same worker path as a
+        galaxy switch."""
+        if self.session is None:
+            return
+        if self._busy_with_worker("loading a CMD file"):
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load CMD file", "", "CMD tables (*.csv *.dat *.txt)")
+        if not path:
+            return
+        base = self.session
+        if isinstance(base, DERIVED):
+            base = base._base
+        self._start_load(CmdSession(base, path), f"loading {path}...")
+
+    # ---------- mock generation ----------
+
+    def _make_mocks(self):
+        """Collect a mock batch's parameters and run make_mocks.generate on
+        a worker. The window is busy meanwhile (the worker loads its own
+        copies of the chosen galaxies, so the session is untouched);
+        Stop on the progress bar cancels between mocks."""
+        if self.session is None:
+            return
+        if self._busy_with_worker("generating mocks"):
+            return
+        current = self.session
+        if isinstance(current, DERIVED):
+            current = current._base
+        dialog = MakeMocksDialog(self.galaxies, current.galaxy, self)
+        if dialog.exec() != MakeMocksDialog.Accepted:
+            return
+        self._set_busy(True, "generating mocks...")
+        self.results.show_progress(0, 0, "starting...")
+        self._mock_worker = MockWorker(self.galaxies, self.constants,
+                                       dialog.kwargs())
+        self._mock_worker.progress.connect(self.results.show_progress)
+        self._mock_worker.done.connect(self._mocks_done)
+        self._mock_worker.failed.connect(self._mocks_failed)
+        self._mock_worker.finished.connect(self._clear_mock_worker)
+        self._mock_worker.start()
+
+    def _clear_mock_worker(self):
+        if self._mock_worker is not None:
+            self._mock_worker.deleteLater()
+            self._mock_worker = None
+
+    def _mocks_done(self, result):
+        self.results.hide_progress()
+        self._set_busy(False, "")
+        folder = result["out_dir"]
+        early = " (stopped early)" if result["cancelled"] else ""
+        self.status_label.setText(
+            f"wrote {result['n']} mocks to {folder}{early}")
+        notes = "\n".join(result["notes"])
+        QMessageBox.information(
+            self, "TRGB",
+            f"Wrote {result['n']} mock CMDs to {folder}{early}.\n\n"
+            f"Answers (keep these out of the tester's hands): "
+            f"{result['master']}\n\n{notes}\n\n"
+            f"PARSEC tip: QT-rectified M = {result['tip_abs_qt']:.3f}; the "
+            f"calibration assumes {self.constants['M_TRGB']:.3f}, so score "
+            f"fitted tips against the sheet's tip_true_qt column, not "
+            f"distance moduli.\n\nOpen a mock with “Load CMD…” after "
+            f"selecting its image in the galaxy box.")
+
+    def _mocks_failed(self, message):
+        self.results.hide_progress()
+        self._set_busy(False, "")
+        QMessageBox.critical(self, "TRGB",
+                             f"Mock generation failed:\n{message}")
 
     # ---------- persistence ----------
 
@@ -771,12 +907,13 @@ class MainWindow(QMainWindow):
     def _save_selection(self):
         if self.session is None:
             return
-        if isinstance(self.session, SyntheticSession):
+        if isinstance(self.session, DERIVED):
             # _selection_path points into the REAL galaxy's data dir, and
             # the file auto-loads on its next real load
             QMessageBox.information(
                 self, "TRGB",
-                "Not saved: a synthetic catalog is loaded, and saving would "
+                "Not saved: a synthetic or CMD-file catalog is loaded, and "
+                "saving would "
                 "overwrite the real galaxy's saved selection. Reload the "
                 "galaxy first.")
             return
@@ -853,10 +990,11 @@ class MainWindow(QMainWindow):
         # proceed past a live worker: cancel what can be cancelled, then
         # block until it finishes (the point fit and a first-time load's
         # chip split are uncancellable but bounded).
-        for worker in (self._fit_worker, self._load_worker):
+        for worker in (self._fit_worker, self._load_worker,
+                       self._mock_worker):
             if worker is None or not worker.isRunning():
                 continue
-            if isinstance(worker, FitWorker):
+            if isinstance(worker, (FitWorker, MockWorker)):
                 worker.cancel()
             if not worker.wait(5000):
                 self.status_label.setText(

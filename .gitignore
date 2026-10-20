@@ -38,3 +38,7 @@ __pycache__/
 build/
 dist/
 *.icns
+
+mocks/answers/
+*.gif
+*.mp4
